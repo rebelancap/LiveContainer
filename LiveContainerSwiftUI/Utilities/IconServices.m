@@ -339,14 +339,43 @@ CGImageRef loadCGImageFromURL(NSURL *url) {
         [iconsNeedToGenerateOriginalIcon addObject:icon];
     }
     
-    IFImage* ifImage = [request generateImageReturningRecordIdentifiers:nil];
+    IFImage* ifImage = nil;
+    @try {
+        ifImage = [request generateImageReturningRecordIdentifiers:nil];
+    } @catch (NSException *exception) {
+        // visionOS: IconServices' _RSBundleRecordIsXROSNative check sends -platform to a
+        // bundle-record class LiveContainer doesn't swizzle (it only swizzles
+        // -[IFBundle platform] above), throwing NSInvalidArgumentException. Uncaught, it
+        // aborts LiveContainer (SIGABRT) the instant its app list renders an icon. Catch
+        // it and fall back to loading the app's own icon file directly.
+        if(style == Original) {
+            [iconsNeedToGenerateOriginalIcon removeObject:icon];
+        }
+        return [self lc_fallbackIconForBundleURL:url];
+    }
     CGImageRef imageRef = [ifImage CGImage];
-    
+
     if(style == Original) {
         [iconsNeedToGenerateOriginalIcon removeObject:icon];
     }
 
     return [UIImage imageWithCGImage:imageRef];
+}
+
+// Fallback used when IconServices generation throws (notably on visionOS): read the
+// app's primary icon PNG straight from its bundle instead of going through the
+// IconServices/LaunchServices path.
++ (instancetype)lc_fallbackIconForBundleURL:(NSURL*)url {
+    NSDictionary* info = [NSDictionary dictionaryWithContentsOfURL:[url URLByAppendingPathComponent:@"Info.plist"]];
+    NSString* base = info[@"CFBundleIcons"][@"CFBundlePrimaryIcon"][@"CFBundleIconFiles"] ? [info[@"CFBundleIcons"][@"CFBundlePrimaryIcon"][@"CFBundleIconFiles"] lastObject] : nil;
+    if(base) {
+        for(NSString* suffix in @[@"@3x", @"@2x", @"", @"@2x~ipad", @"~ipad"]) {
+            NSString* path = [url URLByAppendingPathComponent:[NSString stringWithFormat:@"%@%@.png", base, suffix]].path;
+            UIImage* img = [UIImage imageWithContentsOfFile:path];
+            if(img) return img;
+        }
+    }
+    return [UIImage new];
 }
 
 @end
