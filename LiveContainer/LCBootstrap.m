@@ -109,46 +109,6 @@ static uint64_t rnd64(uint64_t v, uint64_t r) {
     return (v + r) & ~r;
 }
 
-void overwriteMainCFBundle(void) {
-    // Overwrite CFBundleGetMainBundle
-    uint32_t *pc = (uint32_t *)CFBundleGetMainBundle;
-    void **mainBundleAddr = 0;
-    
-#if !TARGET_OS_SIMULATOR
-    if(@available(iOS 27.0, *)) {
-        // at least in iOS 27.0 db1, the logic is inversed and the __mainBundle is right after the first tbz instruction
-        while (true) {
-            bool isTbz = ((*pc) & 0x7F000000) == 0x36000000;
-            if (isTbz) {
-                // adrp <- pc-1
-                // tbz <- pc
-                // ldr  <- addr
-                mainBundleAddr = (void **)aarch64_emulate_adrp_ldr(*(pc-1), *(uint32_t *)(pc+1), (uint64_t)(pc-1));
-                break;
-            }
-            ++pc;
-        }
-    } else {
-#endif
-        while (true) {
-            uint64_t addr = aarch64_get_tbnz_jump_address(*pc, (uint64_t)pc);
-            if (addr) {
-                // adrp <- pc-1
-                // tbnz <- pc
-                // ...
-                // ldr  <- addr
-                mainBundleAddr = (void **)aarch64_emulate_adrp_ldr(*(pc-1), *(uint32_t *)addr, (uint64_t)(pc-1));
-                break;
-            }
-            ++pc;
-        }
-#if !TARGET_OS_SIMULATOR
-    }
-#endif
-    assert(mainBundleAddr != NULL);
-    *mainBundleAddr = (__bridge void *)NSBundle.mainBundle._cfBundle;
-}
-
 // Make [addr, addr+len) writable, using TPRO on hardware that supports it.
 static BOOL lc_makeWritable(void *addr, size_t len) {
     kern_return_t kr = builtin_vm_protect(mach_task_self(), (mach_vm_address_t)addr, len, false, PROT_READ | PROT_WRITE);
@@ -159,79 +119,90 @@ static BOOL lc_makeWritable(void *addr, size_t len) {
     return NO;
 }
 
-// Scan a segment for a slot holding `oldB` and swap it to `newB`, stopping as soon as
-// +[NSBundle mainBundle] reports the new bundle. Returns YES on success.
-static BOOL lc_swapBundleInSegment(uint8_t *segStart, uint64_t segSize, void *oldB, void *newB, NSString *oldPath) {
-    if (!segStart || segSize < sizeof(void *)) return NO;
-    void **p = (void **)segStart;
-    size_t n = (size_t)(segSize / sizeof(void *));
-    for (size_t i = 0; i < n; i++) {
-        if (p[i] != oldB) continue;
-        BOOL tpro = lc_makeWritable(&p[i], sizeof(void *));
-        p[i] = newB;
-        if (tpro) os_thread_self_restrict_tpro_to_ro();
-        if (![NSBundle.mainBundle.executablePath isEqualToString:oldPath]) return YES;
+// The Mach-O image header a function belongs to.
+static const struct mach_header_64 *lc_imageOf(void *fn) {
+    Dl_info info = {0};
+    return dladdr(fn, &info) ? (const struct mach_header_64 *)info.dli_fbase : NULL;
+}
+
+// Point the cached main bundle at the guest, OS-independently. LiveContainer used to
+// locate Foundation's / CoreFoundation's cached main-bundle pointer by disassembling
+// +[NSBundle mainBundle] / CFBundleGetMainBundle with hardcoded per-iOS-version ARM64
+// instruction patterns; those fail on iOS/visionOS 27 and abort. Instead, scan the
+// owning image's writable data segments for the slot that holds `oldP` and swap it to
+// `newP`, stopping when `verify()` confirms the change took. Returns YES on success.
+static BOOL lc_swapMainBundlePointer(const struct mach_header_64 *header, void *oldP, void *newP, BOOL (^verify)(void)) {
+    if (verify()) return YES;
+    if (!header || header->magic != MH_MAGIC_64 || !oldP || oldP == newP) return NO;
+
+    // Slide relative to the __TEXT vmaddr in the load commands.
+    intptr_t slide = 0;
+    const struct load_command *cur = (const struct load_command *)(header + 1);
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        if (cur->cmd == LC_SEGMENT_64 &&
+            strcmp(((const struct segment_command_64 *)cur)->segname, "__TEXT") == 0) {
+            slide = (intptr_t)header - (intptr_t)((const struct segment_command_64 *)cur)->vmaddr;
+            break;
+        }
+        cur = (const struct load_command *)((uint8_t *)cur + cur->cmdsize);
+    }
+
+    // The cached singleton lives in a writable data segment; scan those.
+    static const char *const segs[] = {"__DATA_DIRTY", "__DATA", "__AUTH"};
+    cur = (const struct load_command *)(header + 1);
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        if (cur->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cur;
+            for (int s = 0; s < 3; s++) {
+                if (strcmp(seg->segname, segs[s]) != 0) continue;
+                void **p = (void **)((intptr_t)seg->vmaddr + slide);
+                size_t n = (size_t)(seg->vmsize / sizeof(void *));
+                for (size_t j = 0; j < n; j++) {
+                    if (p[j] != oldP) continue;
+                    BOOL tpro = lc_makeWritable(&p[j], sizeof(void *));
+                    p[j] = newP;
+                    if (tpro) os_thread_self_restrict_tpro_to_ro();
+                    if (verify()) return YES;
+                }
+                break;
+            }
+        }
+        cur = (const struct load_command *)((uint8_t *)cur + cur->cmdsize);
     }
     return NO;
 }
 
+void overwriteMainCFBundle(void) {
+    // CFBundle twin of overwriteMainNSBundle. Runs after it, so NSBundle.mainBundle is
+    // already the guest and ._cfBundle is the guest's CFBundle.
+    CFBundleRef oldCF = CFBundleGetMainBundle();
+    CFBundleRef newCF = (__bridge CFBundleRef)NSBundle.mainBundle._cfBundle;
+    BOOL ok = lc_swapMainBundlePointer(lc_imageOf((void *)CFBundleGetMainBundle),
+                                       (void *)oldCF, (void *)newCF, ^BOOL{
+        return CFBundleGetMainBundle() == newCF;
+    });
+    if (!ok) NSLog(@"[LC-vision] CFBundle swap FAILED (oldCF=%p newCF=%p)", oldCF, newCF);
+}
+
 void overwriteMainNSBundle(NSBundle *newBundle) {
-    // Point NSBundle.mainBundle at the guest bundle. LiveContainer historically located
-    // Foundation's cached mainBundle by disassembling +[NSBundle mainBundle] with
-    // hardcoded iOS 16/17 instruction patterns; that fails on iOS/visionOS 27 (the method
-    // is compiled differently there) and the app aborted. Instead, find Foundation's image
-    // and scan its writable data segments for the cached bundle pointer — OS-independent.
     NSString *oldPath = NSBundle.mainBundle.executablePath;
     void *oldB = (__bridge void *)NSBundle.mainBundle;
     void *newB = (__bridge void *)newBundle;
-
     IMP imp = method_getImplementation(class_getClassMethod(NSBundle.class, @selector(mainBundle)));
-    Dl_info dlinfo = {0};
-    dladdr((void *)imp, &dlinfo);
-    const struct mach_header_64 *header = (const struct mach_header_64 *)dlinfo.dli_fbase;
 
-    BOOL ok = NO;
-    if (header && header->magic == MH_MAGIC_64) {
-        // Slide relative to the __TEXT vmaddr in the load commands.
-        intptr_t slide = 0;
-        const struct load_command *cur = (const struct load_command *)(header + 1);
-        for (uint32_t i = 0; i < header->ncmds; i++) {
-            if (cur->cmd == LC_SEGMENT_64) {
-                const struct segment_command_64 *seg = (const struct segment_command_64 *)cur;
-                if (strcmp(seg->segname, "__TEXT") == 0) {
-                    slide = (intptr_t)header - (intptr_t)seg->vmaddr;
-                    break;
-                }
-            }
-            cur = (const struct load_command *)((uint8_t *)cur + cur->cmdsize);
-        }
-        // The cached singleton lives in a writable data segment; scan those.
-        static const char *const segs[] = {"__DATA_DIRTY", "__DATA", "__AUTH"};
-        cur = (const struct load_command *)(header + 1);
-        for (uint32_t i = 0; i < header->ncmds && !ok; i++) {
-            if (cur->cmd == LC_SEGMENT_64) {
-                const struct segment_command_64 *seg = (const struct segment_command_64 *)cur;
-                for (int s = 0; s < 3; s++) {
-                    if (strcmp(seg->segname, segs[s]) == 0) {
-                        uint8_t *start = (uint8_t *)((intptr_t)seg->vmaddr + slide);
-                        if (lc_swapBundleInSegment(start, seg->vmsize, oldB, newB, oldPath)) ok = YES;
-                        break;
-                    }
-                }
-            }
-            cur = (const struct load_command *)((uint8_t *)cur + cur->cmdsize);
-        }
-    }
+    BOOL ok = lc_swapMainBundlePointer(lc_imageOf((void *)imp), oldB, newB, ^BOOL{
+        return ![NSBundle.mainBundle.executablePath isEqualToString:oldPath];
+    });
 
-    if ([NSBundle.mainBundle.executablePath isEqualToString:oldPath]) {
-        // Not swapped. Don't abort (that's the visionOS crash) — log the device's
-        // +[NSBundle mainBundle] encoding so the pattern can be analyzed, and continue.
+    if (!ok) {
+        // Don't abort (that was the visionOS crash). Log +[NSBundle mainBundle]'s device
+        // encoding so the pattern can be analyzed if the scan ever misses.
         uint32_t *pi = (uint32_t *)imp;
-        NSMutableString *dump = [NSMutableString stringWithFormat:@"[LC-vision] mainBundle swap FAILED imp=%p header=%p oldB=%p instrs:", imp, header, oldB];
+        NSMutableString *dump = [NSMutableString stringWithFormat:@"[LC-vision] NSBundle swap FAILED imp=%p oldB=%p instrs:", imp, oldB];
         for (int i = 0; i < 48; i++) [dump appendFormat:@" %08x", pi[i]];
         NSLog(@"%@", dump);
     } else {
-        NSLog(@"[LC-vision] mainBundle overwrite OK via data-segment scan");
+        NSLog(@"[LC-vision] NSBundle overwrite OK");
     }
 }
 
