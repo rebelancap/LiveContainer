@@ -149,32 +149,90 @@ void overwriteMainCFBundle(void) {
     *mainBundleAddr = (__bridge void *)NSBundle.mainBundle._cfBundle;
 }
 
+// Make [addr, addr+len) writable, using TPRO on hardware that supports it.
+static BOOL lc_makeWritable(void *addr, size_t len) {
+    kern_return_t kr = builtin_vm_protect(mach_task_self(), (mach_vm_address_t)addr, len, false, PROT_READ | PROT_WRITE);
+    if (kr != KERN_SUCCESS && os_tpro_is_supported()) {
+        os_thread_self_restrict_tpro_to_rw();
+        return YES; // used TPRO
+    }
+    return NO;
+}
+
+// Scan a segment for a slot holding `oldB` and swap it to `newB`, stopping as soon as
+// +[NSBundle mainBundle] reports the new bundle. Returns YES on success.
+static BOOL lc_swapBundleInSegment(uint8_t *segStart, uint64_t segSize, void *oldB, void *newB, NSString *oldPath) {
+    if (!segStart || segSize < sizeof(void *)) return NO;
+    void **p = (void **)segStart;
+    size_t n = (size_t)(segSize / sizeof(void *));
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] != oldB) continue;
+        BOOL tpro = lc_makeWritable(&p[i], sizeof(void *));
+        p[i] = newB;
+        if (tpro) os_thread_self_restrict_tpro_to_ro();
+        if (![NSBundle.mainBundle.executablePath isEqualToString:oldPath]) return YES;
+    }
+    return NO;
+}
+
 void overwriteMainNSBundle(NSBundle *newBundle) {
-    // Overwrite NSBundle.mainBundle
-    // iOS 16: x19 is _MergedGlobals
-    // iOS 17: x19 is _MergedGlobals+4
-
+    // Point NSBundle.mainBundle at the guest bundle. LiveContainer historically located
+    // Foundation's cached mainBundle by disassembling +[NSBundle mainBundle] with
+    // hardcoded iOS 16/17 instruction patterns; that fails on iOS/visionOS 27 (the method
+    // is compiled differently there) and the app aborted. Instead, find Foundation's image
+    // and scan its writable data segments for the cached bundle pointer — OS-independent.
     NSString *oldPath = NSBundle.mainBundle.executablePath;
-    uint32_t *mainBundleImpl = (uint32_t *)method_getImplementation(class_getClassMethod(NSBundle.class, @selector(mainBundle)));
-    for (int i = 0; i < 20; i++) {
-        void **_MergedGlobals = (void **)aarch64_emulate_adrp_add(mainBundleImpl[i], mainBundleImpl[i+1], (uint64_t)&mainBundleImpl[i]);
-        if (!_MergedGlobals) continue;
+    void *oldB = (__bridge void *)NSBundle.mainBundle;
+    void *newB = (__bridge void *)newBundle;
 
-        // In iOS 17, adrp+add gives _MergedGlobals+4, so it uses ldur instruction instead of ldr
-        if ((mainBundleImpl[i+4] & 0xFF000000) == 0xF8000000) {
-            uint64_t ptr = (uint64_t)_MergedGlobals - 4;
-            _MergedGlobals = (void **)ptr;
-        }
+    IMP imp = method_getImplementation(class_getClassMethod(NSBundle.class, @selector(mainBundle)));
+    Dl_info dlinfo = {0};
+    dladdr((void *)imp, &dlinfo);
+    const struct mach_header_64 *header = (const struct mach_header_64 *)dlinfo.dli_fbase;
 
-        for (int mgIdx = 0; mgIdx < 20; mgIdx++) {
-            if (_MergedGlobals[mgIdx] == (__bridge void *)NSBundle.mainBundle) {
-                _MergedGlobals[mgIdx] = (__bridge void *)newBundle;
-                break;
+    BOOL ok = NO;
+    if (header && header->magic == MH_MAGIC_64) {
+        // Slide relative to the __TEXT vmaddr in the load commands.
+        intptr_t slide = 0;
+        const struct load_command *cur = (const struct load_command *)(header + 1);
+        for (uint32_t i = 0; i < header->ncmds; i++) {
+            if (cur->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)cur;
+                if (strcmp(seg->segname, "__TEXT") == 0) {
+                    slide = (intptr_t)header - (intptr_t)seg->vmaddr;
+                    break;
+                }
             }
+            cur = (const struct load_command *)((uint8_t *)cur + cur->cmdsize);
+        }
+        // The cached singleton lives in a writable data segment; scan those.
+        static const char *const segs[] = {"__DATA_DIRTY", "__DATA", "__AUTH"};
+        cur = (const struct load_command *)(header + 1);
+        for (uint32_t i = 0; i < header->ncmds && !ok; i++) {
+            if (cur->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)cur;
+                for (int s = 0; s < 3; s++) {
+                    if (strcmp(seg->segname, segs[s]) == 0) {
+                        uint8_t *start = (uint8_t *)((intptr_t)seg->vmaddr + slide);
+                        if (lc_swapBundleInSegment(start, seg->vmsize, oldB, newB, oldPath)) ok = YES;
+                        break;
+                    }
+                }
+            }
+            cur = (const struct load_command *)((uint8_t *)cur + cur->cmdsize);
         }
     }
 
-    assert(![NSBundle.mainBundle.executablePath isEqualToString:oldPath]);
+    if ([NSBundle.mainBundle.executablePath isEqualToString:oldPath]) {
+        // Not swapped. Don't abort (that's the visionOS crash) — log the device's
+        // +[NSBundle mainBundle] encoding so the pattern can be analyzed, and continue.
+        uint32_t *pi = (uint32_t *)imp;
+        NSMutableString *dump = [NSMutableString stringWithFormat:@"[LC-vision] mainBundle swap FAILED imp=%p header=%p oldB=%p instrs:", imp, header, oldB];
+        for (int i = 0; i < 48; i++) [dump appendFormat:@" %08x", pi[i]];
+        NSLog(@"%@", dump);
+    } else {
+        NSLog(@"[LC-vision] mainBundle overwrite OK via data-segment scan");
+    }
 }
 
 typedef struct {
