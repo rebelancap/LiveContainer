@@ -18,7 +18,10 @@ extern NSBundle *lcMainBundle;
         void* taskSelf = SecTaskCreateFromSelf(NULL);
         CFErrorRef error = NULL;
         CFTypeRef cfans = SecTaskCopyValueForEntitlement(taskSelf, CFSTR("com.apple.developer.team-identifier"), &error);
-        if(CFGetTypeID(cfans) == CFStringGetTypeID()) {
+        // A binary signed without that entitlement (an app extension is easy to miss)
+        // gets NULL back, and CFGetTypeID(NULL) dereferences it — crashing at launch
+        // before the keychain fallback below ever gets a chance to run.
+        if(cfans && CFGetTypeID(cfans) == CFStringGetTypeID()) {
             ans = (__bridge NSString*)cfans;
         }
         CFRelease(taskSelf);
