@@ -368,9 +368,49 @@ CGImageRef loadCGImageFromURL(NSURL *url) {
 // Fallback used when IconServices generation throws (notably on visionOS): read the
 // app's primary icon PNG straight from its bundle instead of going through the
 // IconServices/LaunchServices path.
+/// Best-effort icon base name from a guest's Info.plist.
+///
+/// Every value here comes from an arbitrary third-party bundle, so no container type
+/// can be assumed. `CFBundlePrimaryIcon` is legally either a dictionary or a plain
+/// string; the string form used to reach `objectForKeyedSubscript:` and abort with
+/// "unrecognized selector sent to NSTaggedPointerString". That happens while the app
+/// list is rendering, so a single such app bricks LiveContainer — it crashes on every
+/// launch, with no way to reach the entry and remove it.
+static NSString *lc_iconBaseNameFromInfo(NSDictionary *info) {
+    if(![info isKindOfClass:NSDictionary.class]) return nil;
+
+    for(NSString *key in @[@"CFBundleIcons", @"CFBundleIcons~ipad"]) {
+        id icons = info[key];
+        if(![icons isKindOfClass:NSDictionary.class]) continue;
+
+        id primary = icons[@"CFBundlePrimaryIcon"];
+        if([primary isKindOfClass:NSString.class]) return primary;
+        if(![primary isKindOfClass:NSDictionary.class]) continue;
+
+        id files = primary[@"CFBundleIconFiles"];
+        if([files isKindOfClass:NSArray.class]) {
+            id last = [files lastObject];
+            if([last isKindOfClass:NSString.class]) return last;
+        }
+        id name = primary[@"CFBundleIconName"];
+        if([name isKindOfClass:NSString.class]) return name;
+    }
+
+    // Pre-CFBundleIcons layouts.
+    id files = info[@"CFBundleIconFiles"];
+    if([files isKindOfClass:NSArray.class]) {
+        id last = [files lastObject];
+        if([last isKindOfClass:NSString.class]) return last;
+    }
+    id file = info[@"CFBundleIconFile"];
+    if([file isKindOfClass:NSString.class]) return file;
+
+    return nil;
+}
+
 + (instancetype)lc_fallbackIconForBundleURL:(NSURL*)url {
     NSDictionary* info = [NSDictionary dictionaryWithContentsOfURL:[url URLByAppendingPathComponent:@"Info.plist"]];
-    NSString* base = info[@"CFBundleIcons"][@"CFBundlePrimaryIcon"][@"CFBundleIconFiles"] ? [info[@"CFBundleIcons"][@"CFBundlePrimaryIcon"][@"CFBundleIconFiles"] lastObject] : nil;
+    NSString* base = lc_iconBaseNameFromInfo(info);
     if(base) {
         for(NSString* suffix in @[@"@3x", @"@2x", @"", @"@2x~ipad", @"~ipad"]) {
             NSString* path = [url URLByAppendingPathComponent:[NSString stringWithFormat:@"%@%@.png", base, suffix]].path;
