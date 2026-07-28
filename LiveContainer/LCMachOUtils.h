@@ -7,6 +7,13 @@ typedef void (^LCParseMachOCallback)(const char *path, struct mach_header_64 *he
 #define PATCH_EXEC_RESULT_SEG_COUNT_MISMATCH 2
 
 void LCPatchAppBundleFixupARM64eSlice(NSURL *bundleURL);
+#if TARGET_OS_VISION
+/// Retag one Mach-O as visionOS (see LCMachOUtils.m) so the native visionOS host can
+/// dlopen a guest built for iOS.
+void LCPatchMachOPlatformToXROS(const char *path);
+/// Retag every Mach-O in a guest bundle — executable, frameworks, plugins, dylibs.
+void LCPatchAppBundlePlatformToXROS(NSURL *bundleURL);
+#endif
 NSString *LCParseMachO(const char *path, bool readOnly, NS_NOESCAPE LCParseMachOCallback callback);
 void LCPatchAddRPath(const char *path, struct mach_header_64 *header);
 int LCPatchExecSlice(const char *path, struct mach_header_64 *header, bool doInject);

@@ -109,6 +109,79 @@ void LCPatchAddRPath(const char *path, struct mach_header_64 *header) {
     insertRPathCommand("@loader_path", header);
 }
 
+#if TARGET_OS_VISION
+#ifndef PLATFORM_XROS
+#define PLATFORM_XROS 11
+#endif
+
+/// Retag an iOS-built Mach-O as visionOS so the host can load it.
+///
+/// dyld refuses a mach-o whose platform doesn't match the running process —
+/// "incompatible platform (have 'iOS', need 'visionOS')" — and LiveContainer runs a
+/// guest by dlopen()ing it into itself. Guests are built for iOS, so on a native
+/// visionOS host every guest image (the executable AND anything it links from its
+/// bundle) has to claim xrOS. Verified on-device: a retagged iOS binary — including
+/// a real game — loads, links against the visionOS frameworks, and runs.
+///
+/// Returns YES if this image was changed.
+static BOOL patchPlatformToXROS(struct mach_header_64 *header) {
+    struct load_command *command = (struct load_command *)(header + 1);
+    BOOL patched = NO;
+    for(int i = 0; i < header->ncmds; i++) {
+        if(command->cmd == LC_BUILD_VERSION) {
+            struct build_version_command *bv = (struct build_version_command *)command;
+            if(bv->platform != PLATFORM_XROS) {
+                bv->platform = PLATFORM_XROS;
+                // visionOS 1.0 in xxxx.yy.zz form; guests target iOS versions that
+                // have no meaning here, and a too-high minos would be rejected.
+                bv->minos = 1 << 16;
+                patched = YES;
+            }
+        } else if(command->cmd == LC_VERSION_MIN_IPHONEOS) {
+            // Pre-LC_BUILD_VERSION binaries carry this instead, and dyld reads it as
+            // "iOS". There's no visionOS equivalent, so neuter it to a no-op command
+            // (LC_BUILD_VERSION above is what the loader will then use).
+            command->cmd = LC_SOURCE_VERSION;
+            patched = YES;
+        }
+        command = (struct load_command *)((void *)command + command->cmdsize);
+    }
+    return patched;
+}
+
+void LCPatchMachOPlatformToXROS(const char *path) {
+    LCParseMachO(path, false, ^(const char *path, struct mach_header_64 *header, int fd, void *filePtr) {
+        if(patchPlatformToXROS(header)) {
+            NSLog(@"[LC-vision] retagged %s as visionOS", path);
+        }
+    });
+}
+
+void LCPatchAppBundlePlatformToXROS(NSURL *bundleURL) {
+    // Every Mach-O the guest may load has to agree on the platform, not just its
+    // main executable: dyld checks each image as it's brought in, so a bundled
+    // framework left tagged iOS fails the guest at load time.
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSDirectoryEnumerator *enumerator = [fm enumeratorAtURL:bundleURL includingPropertiesForKeys:nil options:NSDirectoryEnumerationSkipsHiddenFiles errorHandler:nil];
+    for (NSURL *fileURL in enumerator) {
+        NSString *ext = fileURL.pathExtension;
+        if ([ext isEqualToString:@"dylib"]) {
+            LCPatchMachOPlatformToXROS(fileURL.path.fileSystemRepresentation);
+        } else if ([ext isEqualToString:@"framework"] || [ext isEqualToString:@"appex"]) {
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfURL:[fileURL URLByAppendingPathComponent:@"Info.plist"]];
+            NSString *executableName = info[@"CFBundleExecutable"];
+            if(!executableName) {
+                executableName = fileURL.lastPathComponent.stringByDeletingPathExtension;
+            }
+            NSURL *executableURL = [fileURL URLByAppendingPathComponent:executableName];
+            if([fm fileExistsAtPath:executableURL.path]) {
+                LCPatchMachOPlatformToXROS(executableURL.path.fileSystemRepresentation);
+            }
+        }
+    }
+}
+#endif
+
 int LCPatchExecSlice(const char *path, struct mach_header_64 *header, bool doInject) {
     uint8_t *imageHeaderPtr = (uint8_t*)header + sizeof(struct mach_header_64);
     int ans = 0;

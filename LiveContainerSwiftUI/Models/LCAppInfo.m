@@ -309,7 +309,15 @@ uint32_t dyld_get_sdk_version(const struct mach_header* mh);
     NSString *execPath = [NSString stringWithFormat:@"%@/%@", appPath, _infoPlist[@"CFBundleExecutable"]];
     
     // Update patch
+#if TARGET_OS_VISION
+    // Bumped for visionOS platform retagging: apps patched by an earlier build are
+    // still tagged iOS and won't load, so they need re-patching. Kept out of the iOS
+    // build so its users aren't forced to re-sign every app for a change that
+    // doesn't affect them.
+    int currentPatchRev = 8;
+#else
     int currentPatchRev = 7;
+#endif
     bool needPatch = [info[@"LCPatchRevision"] intValue] < currentPatchRev;
     if (needPatch || forceSign) {
         // copy-delete-move to avoid EXC_BAD_ACCESS (SIGKILL - CODESIGNING)
@@ -340,6 +348,14 @@ uint32_t dyld_get_sdk_version(const struct mach_header* mh);
         });
         is32bit = !has64bitSlice;
         LCPatchAppBundleFixupARM64eSlice([NSURL fileURLWithPath:appPath]);
+#if TARGET_OS_VISION
+        // Guests ship as iOS binaries, and a native visionOS host can only dlopen
+        // them once every image in the bundle claims the visionOS platform. Runs
+        // after the exec patch and before signing, so the retagged headers are what
+        // gets signed.
+        LCPatchAppBundlePlatformToXROS([NSURL fileURLWithPath:appPath]);
+        LCPatchMachOPlatformToXROS(execPath.UTF8String);
+#endif
         if (isEncrypted) {
             error = @"The app you tried to install is encrypted. Please provide decrypted app.";
         }
