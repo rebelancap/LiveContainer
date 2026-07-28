@@ -96,7 +96,13 @@
 
 - (void)setupDecoratedView {
     CGFloat navBarHeight = 44;
+    // visionOS has no status-bar orientation; guest windows start portrait-shaped
+    // and the user resizes them in space.
+#if TARGET_OS_VISION
+    BOOL isLandscape = NO;
+#else
     BOOL isLandscape = UIInterfaceOrientationIsLandscape(UIApp.statusBarOrientation);
+#endif
     CGRect frame = CGRectMake(0, 0, isLandscape ? 480 : 320, (isLandscape ? 320 : 480) + navBarHeight);
     CGPoint rootViewCenter = self.view.superview.center;
     frame.origin = CGPointMake(rootViewCenter.x - frame.size.width / 2, rootViewCenter.y - frame.size.height / 2);
@@ -543,6 +549,9 @@
     
     // scale peripheryInsets to match the scale ratio
     settings.peripheryInsets = UIEdgeInsetsMake(settings.peripheryInsets.top/_scaleRatio, settings.peripheryInsets.left/_scaleRatio, settings.peripheryInsets.bottom/_scaleRatio, settings.peripheryInsets.right/_scaleRatio);
+    // On visionOS there is no status-bar orientation to rotate insets against, so
+    // take the unrotated (iPad-shaped) path.
+#if !TARGET_OS_VISION
     if(UIDevice.currentDevice.userInterfaceIdiom != UIUserInterfaceIdiomPad) {
         UIInterfaceOrientation currentOrientation = UIApp.statusBarOrientation;
         if(UIInterfaceOrientationIsLandscape(currentOrientation)) {
@@ -550,7 +559,9 @@
         }
         settings.safeAreaInsetsPortrait = LCUIEdgeInsetsRotateToOrientation(settings.peripheryInsets, currentOrientation);
 
-    } else {
+    } else
+#endif
+    {
         settings.safeAreaInsetsPortrait = UIEdgeInsetsMake(settings.peripheryInsets.top, settings.peripheryInsets.left, settings.peripheryInsets.bottom, settings.peripheryInsets.right);
     }
     

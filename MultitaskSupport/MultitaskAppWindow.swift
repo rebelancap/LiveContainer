@@ -75,8 +75,13 @@ struct AppSceneViewSwiftUI: UIViewControllerRepresentable {
                 let defaultInsets = vc.view.window?.safeAreaInsets ?? .zero
                 settings.peripheryInsets = defaultInsets
                 settings.safeAreaInsetsPortrait = defaultInsets
+                // Device/status-bar orientation don't exist on visionOS; a guest's
+                // window is sized from the view itself, which the landscape branch
+                // below already handles.
+                #if !os(visionOS)
                 settings.deviceOrientation = UIDevice.current.orientation
                 settings.setInterfaceOrientation(UIApplication.shared.statusBarOrientation)
+                #endif
                 if(settings.interfaceOrientation().isLandscape) {
                     settings.setFrame(CGRect(x: 0, y: 0, width: vc.view.frame.size.height, height: vc.view.frame.size.width))
                 } else {

@@ -71,7 +71,14 @@ class SceneDelegate: NSObject, UIWindowSceneDelegate, ObservableObject { // Make
         if newOptions == nil {
             newOptions = UIScene.ActivationRequestOptions()
         }
+        // "Does the key window fill the screen?" has no visionOS analogue — windows
+        // are spatial and system-sized, with no screen to fill — so never request
+        // fullscreen there.
+        #if os(visionOS)
+        newOptions!._setRequestFullscreen(false)
+        #else
         newOptions!._setRequestFullscreen(UIScreen.main.bounds == self.keyWindow!.bounds)
+        #endif
         self.hook_requestSceneSessionActivation(sceneSession, userActivity: userActivity, options: newOptions, errorHandler: errorHandler)
     }
     

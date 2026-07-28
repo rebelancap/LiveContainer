@@ -313,7 +313,10 @@ CGImageRef loadCGImageFromURL(NSURL *url) {
     
 
     descriptor.ignoreCache = YES;
-    descriptor.scale = UIScreen.mainScreen.scale;
+    // `UIScreen` is unavailable on visionOS; the current trait collection carries
+    // the display scale on every platform (same value as before on iOS).
+    CGFloat lcDisplayScale = UITraitCollection.currentTraitCollection.displayScale;
+    descriptor.scale = lcDisplayScale > 0 ? lcDisplayScale : 2.0;
     descriptor.variantOptions = 0;
 
     if (@available(iOS 16.0, *)) {

@@ -123,7 +123,11 @@
     void (^updateSceneSettings)(id) = ^void(UIMutableApplicationSceneSettings *settings) {
         settings.canShowAlerts = YES;
         settings.cornerRadiusConfiguration = [[PrivClass(BSCornerRadiusConfiguration) alloc] initWithTopLeft:self.view.layer.cornerRadius bottomLeft:self.view.layer.cornerRadius bottomRight:self.view.layer.cornerRadius topRight:self.view.layer.cornerRadius];
+        // No `UIScreen` on visionOS to take a display configuration from; the system
+        // supplies one for the spatial scene.
+#if !TARGET_OS_VISION
         settings.displayConfiguration = UIScreen.mainScreen.displayConfiguration;
+#endif
         settings.foreground = YES;
         //settings.interruptionPolicy = 2; // reconnect
         settings.level = 1;
@@ -259,7 +263,10 @@
             return;
         }
         [self updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
+            // visionOS has no device orientation.
+#if !TARGET_OS_VISION
             settings.deviceOrientation = UIDevice.currentDevice.orientation;
+#endif
             settings.interfaceOrientation = self.view.window.windowScene.interfaceOrientation;
             CGRect frame = self.view.frame;
             if(!self.usesHostingControllerAPI) {

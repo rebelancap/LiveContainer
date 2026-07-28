@@ -294,17 +294,23 @@ class AppInfoProvider {
             name: UserDefaults.didChangeNotification,
             object: LCUtils.appGroupUserDefault
         )
+        // visionOS has no device orientation — windows are placed in space rather
+        // than rotating with the device.
+        #if !os(visionOS)
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(deviceOrientationDidChange),
             name: UIDevice.orientationDidChangeNotification,
             object: nil
         )
+        #endif
     }
-    
+
     deinit {
         NotificationCenter.default.removeObserver(self)
+        #if !os(visionOS)
         NotificationCenter.default.removeObserver(self, name: UIDevice.orientationDidChangeNotification, object: nil)
+        #endif
     }
 
     @objc private func deviceOrientationDidChange() {
@@ -548,14 +554,20 @@ class AppInfoProvider {
         if isSwipingAway {
             guard !self.isDockHidden else { return false }
             self.hideDockToSide()
+            // No haptics on visionOS.
+            #if !os(visionOS)
             let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
             impactFeedback.impactOccurred()
+            #endif
             return true
         } else {
             guard self.isDockHidden else { return false }
             self.showDockFromHidden()
+            // No haptics on visionOS.
+            #if !os(visionOS)
             let impactFeedback = UIImpactFeedbackGenerator(style: .light)
             impactFeedback.impactOccurred()
+            #endif
             return true
         }
     }
@@ -770,39 +782,45 @@ class AppInfoProvider {
         }
     }
     
-    // Add edge gesture recognition areas when dock is hidden
+    // Add edge gesture recognition areas when dock is hidden.
+    // Screen-edge pans are an iOS affordance: visionOS windows have no screen edges
+    // to swipe in from, so the reveal-by-edge-swipe gesture doesn't apply there.
     private func setupEdgeGestureRecognizers() {
+        #if !os(visionOS)
         guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
               let keyWindow = windowScene.windows.first else { return }
-        
+
         keyWindow.gestureRecognizers?.removeAll { gesture in
             return gesture is UITapGestureRecognizer || gesture is UIScreenEdgePanGestureRecognizer
         }
-        
+
         if isDockHidden {
             let leftEdgeGesture = UIScreenEdgePanGestureRecognizer(target: self, action: #selector(handleEdgeSwipe(_:)))
             leftEdgeGesture.edges = .left
             keyWindow.addGestureRecognizer(leftEdgeGesture)
-            
+
             let rightEdgeGesture = UIScreenEdgePanGestureRecognizer(target: self, action: #selector(handleEdgeSwipe(_:)))
             rightEdgeGesture.edges = .right
             keyWindow.addGestureRecognizer(rightEdgeGesture)
         }
+        #endif
     }
-    
+
+    #if !os(visionOS)
     @objc private func handleEdgeSwipe(_ gesture: UIScreenEdgePanGestureRecognizer) {
         guard isDockHidden, gesture.state == .began || gesture.state == .changed else {
             return
         }
-        
+
         let translation = gesture.translation(in: gesture.view)
         let swipeDistance = abs(translation.x)
-        
+
         if swipeDistance > Constants.edgeSwipeThreshold {
             showDockFromHidden()
         }
     }
-    
+    #endif
+
     // MARK: - Multitask Mode Check
     private func isDockEnabled() -> Bool {
         let multitaskMode = MultitaskMode(rawValue: LCUtils.appGroupUserDefault.integer(forKey: "LCMultitaskMode")) ?? .virtualWindow
@@ -853,6 +871,10 @@ public struct MultitaskDockSwiftView: View {
             }
             .padding(dynamicPadding)
             .modifier { content in
+                // Liquid Glass isn't offered on visionOS (its own material system
+                // already renders windows this way), so fall through to the plain
+                // rounded background there.
+                #if !os(visionOS)
                 if #available(iOS 26.0, *), SharedModel.isLiquidGlassEnabled {
                     content.glassEffect(.regular, in: .rect(cornerRadius: 15))
                 } else {
@@ -865,6 +887,16 @@ public struct MultitaskDockSwiftView: View {
                             )
                     )
                 }
+                #else
+                content.background(
+                    RoundedRectangle(cornerRadius: 15)
+                        .fill(Color.black.opacity(dockManager.isDockHidden ? 0.3 : 0.7))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 15)
+                                .stroke(Color.white.opacity(dockManager.isDockHidden ? 0.1 : 0.3), lineWidth: 1)
+                        )
+                )
+                #endif
             }
             .scaleEffect(dockManager.isVisible ? 1.0 : 0.8)
             .opacity(dockManager.isDockHidden ? (hideCollapsedDock && dockManager.isCollapsed ? 0.01 : 0.4) : 1.0)
@@ -1129,8 +1161,11 @@ struct AppIconView: View {
             },
             onRelease: { location in 
                 isPressed = false
+                // No haptics on visionOS.
+                #if !os(visionOS)
                 let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
                 impactFeedback.impactOccurred()
+                #endif
                 let _ = dockManager.bringMultitaskViewToFront(uuid: app.appUUID, from: location)
             }
         )

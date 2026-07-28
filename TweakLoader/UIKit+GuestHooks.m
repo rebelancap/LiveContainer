@@ -104,7 +104,7 @@ void LCShowSwitchAppConfirmation(NSURL *url, NSString* bundleId, bool isSharedAp
     }
 
     NSString *message = [@"lc.guestTweak.appSwitchTip %@" localizeWithFormat:bundleId];
-    UIWindow *window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    UIWindow *window = LCCreateAlertWindow();
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"LiveContainer" message:message preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"lc.common.ok".loc style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
         [NSUserDefaults.lcUserDefaults setBool:NO forKey:@"LCOpenSideStore"];
@@ -137,7 +137,7 @@ void LCShowSwitchAppConfirmation(NSURL *url, NSString* bundleId, bool isSharedAp
 }
 
 void LCShowAlert(NSString* message) {
-    UIWindow *window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    UIWindow *window = LCCreateAlertWindow();
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"LiveContainer" message:message preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"lc.common.ok".loc style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
         window.windowScene = nil;
@@ -205,7 +205,7 @@ void LCOpenWebPage(NSString* webPageUrlString, NSString* originalUrl) {
     }
     
     NSString *message = @"lc.guestTweak.openWebPageTip".loc;
-    UIWindow *window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    UIWindow *window = LCCreateAlertWindow();
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"LiveContainer" message:message preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"lc.common.ok".loc style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
         [NSClassFromString(@"LCSharedUtils") setWebPageUrlForNextLaunch:webPageUrlString];
@@ -248,7 +248,7 @@ void LCOpenSideStoreURL(NSURL* sidestoreUrl) {
         [NSClassFromString(@"LCSharedUtils") launchToGuestApp];
     }
     NSString *message = [@"lc.guestTweak.appSwitchTip %@" localizeWithFormat:@"SideStore"];
-    UIWindow *window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    UIWindow *window = LCCreateAlertWindow();
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"LiveContainer" message:message preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"lc.common.ok".loc style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
         [NSUserDefaults.lcUserDefaults setObject:sidestoreUrl.absoluteString forKey:@"launchAppUrlScheme"];
@@ -768,11 +768,18 @@ static LCControlAppURLHandling LCHandleControlAppURL(NSURL *url, NSString** modi
     [self hook_setHidden:hidden];
 }
 - (void)updateWindowScene {
-    for(UIWindowScene *windowScene in UIApplication.sharedApplication.connectedScenes) {
-        if(!self.windowScene && self.screen == windowScene.screen) {
-            self.windowScene = windowScene;
-            break;
-        }
+    if(self.windowScene) return;
+    for(UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if(![scene isKindOfClass:UIWindowScene.class]) continue;
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+#if !TARGET_OS_VISION
+        // Adopt the scene sitting on the same display as this window. visionOS has
+        // no `screen` (unavailable in that SDK) and no multi-display concept to
+        // disambiguate with, so there the first window scene is the right one.
+        if(self.screen != windowScene.screen) continue;
+#endif
+        self.windowScene = windowScene;
+        break;
     }
 }
 @end

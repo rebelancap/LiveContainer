@@ -57,7 +57,7 @@ static void loadTweaksRecursively(NSURL *folderURL, NSMutableArray *errors) {
 }
 
 static void showDlerrAlert(NSString *error) {
-    UIWindow *window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    UIWindow *window = LCCreateAlertWindow();
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Failed to load tweaks" message:error preferredStyle:UIAlertControllerStyleAlert];
     UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
         window.windowScene = nil;
