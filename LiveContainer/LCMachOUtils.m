@@ -608,6 +608,10 @@ bool checkCodeSignature(const char* path) {
         siginfo.fs_blob_size  = codeSignatureCommand->datasize;
         int addFileSigsReault = fcntl(fd, F_ADDFILESIGS_RETURN, &siginfo);
         if ( addFileSigsReault == -1 ) {
+            // The kernel rejected the signature blob outright. Without this the
+            // caller only learns "signature invalid", which is indistinguishable
+            // from a dozen unrelated causes.
+            NSLog(@"[LC] F_ADDFILESIGS failed for %s: %s (errno %d)", path, strerror(errno), errno);
             ans = false;
             return;
         }
@@ -624,6 +628,11 @@ bool checkCodeSignature(const char* path) {
             ans = true;
             return;
         } else {
+            // F_CHECK_LV fills in a human-readable reason (team mismatch, untrusted
+            // signer, ...). Surface it: "signature invalid" alone gives a user
+            // nothing to act on and hides the actual library-validation failure.
+            NSLog(@"[LC] library validation rejected %s: %s (errno %d)",
+                  path, messageBuffer[0] ? messageBuffer : "no message", errno);
             ans = false;
             return;
         }
