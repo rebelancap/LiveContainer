@@ -54,6 +54,19 @@ class SceneDelegate: NSObject, UIWindowSceneDelegate, ObservableObject { // Make
 
     func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
         self.window = (scene as? UIWindowScene)?.keyWindow
+        #if os(visionOS)
+        // One-shot: after a single-app guest ran, the shell hands the UI the guest's last
+        // window geometry — snap back to the size the UI had when RUN was pinched
+        // (saved in LCAppModel.runApp just before the guest handoff).
+        if let windowScene = scene as? UIWindowScene,
+           let saved = UserDefaults.standard.array(forKey: "LCLastUIWindowSize") as? [Double],
+           saved.count == 2 {
+            UserDefaults.standard.removeObject(forKey: "LCLastUIWindowSize")
+            DispatchQueue.main.async {
+                windowScene.requestGeometryUpdate(.Vision(size: CGSize(width: saved[0], height: saved[1])))
+            }
+        }
+        #endif
     }
     
 }

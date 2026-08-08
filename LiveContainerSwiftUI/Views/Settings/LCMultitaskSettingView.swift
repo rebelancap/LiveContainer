@@ -19,9 +19,19 @@ struct LCMultitaskSettingView: View {
     @AppStorage("LCDockWidth", store: LCUtils.appGroupUserDefault) var dockWidth: Double = 80
     @AppStorage("LCHideCollapsedDock", store: LCUtils.appGroupUserDefault) var hideCollapsedDock: Bool = false
     @AppStorage("LCRedirectURLToHost", store: LCUtils.appGroupUserDefault) var redirectURLToHost = false
-    
+    @AppStorage("LCVisionSingleAppMode") var visionSingleAppMode = true
+
     var body: some View {
         List {
+            #if os(visionOS)
+            Section {
+                Toggle(isOn: $visionSingleAppMode) {
+                    Text("Single-App Mode")
+                }
+            } footer: {
+                Text("The app takes over LiveContainer's process and gets a real system scene, so ornaments and 3D/immersive mode work. Quitting the app returns to LiveContainer automatically (requires the LiveContainer2 relay install). Turn off to host apps inside LiveContainer's own window instead (no 3D).")
+            }
+            #endif
             Section {
                 if(UIApplication.shared.supportsMultipleScenes) {
                     Picker(selection: $multitaskMode) {

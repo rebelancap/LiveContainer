@@ -136,12 +136,24 @@ class LCAppModel: ObservableObject, Hashable {
     
     public var shouldLaunchInMultitaskMode : Bool {
         get {
+            #if os(visionOS)
+            // Single-app mode (guest takes over LC's process) is the DEFAULT: the guest gets a
+            // real shell-backed scene, so shell-owned features (ornaments, ImmersiveSpace/3D)
+            // work, and quitting auto-returns to LC via the sibling relay. Multitask/LiveProcess
+            // hosting (guest scene hosted in LC's WindowGroup) remains opt-out via Settings →
+            // Multitask — extensions can't open immersive scenes, so no 3D there.
+            if UserDefaults.standard.object(forKey: "LCVisionSingleAppMode") == nil {
+                return false
+            }
+            return !UserDefaults.standard.bool(forKey: "LCVisionSingleAppMode")
+            #else
             if #available(iOS 16.0, *) {
                 return uiIsMultitaskModeSpecificed == .yes ||
                 (uiIsMultitaskModeSpecificed == .default && UserDefaults.standard.bool(forKey: "LCLaunchInMultitaskMode"))
             } else {
                 return false
             }
+            #endif
         }
     }
     
@@ -366,6 +378,19 @@ class LCAppModel: ObservableObject, Hashable {
                 let fileURL = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0].appendingPathComponent("preloadLibraries.txt")
                 try fileContents?.write(to: fileURL)
             }
+            #if os(visionOS)
+            // Single-app guest and LC UI share one scene session, so the shell restores the
+            // GUEST's last window geometry (game-sized) onto the relaunched-after-quit UI.
+            // Remember the UI's size now; SceneDelegate restores it one-shot on reconnect.
+            await MainActor.run {
+                if let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first {
+                    let size = scene.coordinateSpace.bounds.size
+                    if size.width > 1, size.height > 1 {
+                        UserDefaults.standard.set([size.width, size.height], forKey: "LCLastUIWindowSize")
+                    }
+                }
+            }
+            #endif
             LCSharedUtils.launchToGuestApp()
         }
         
