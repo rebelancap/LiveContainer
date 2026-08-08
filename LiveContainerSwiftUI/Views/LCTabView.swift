@@ -162,6 +162,16 @@ struct LCTabView: View {
     }
     
     func dispatchURL(url: URL) {
+#if os(visionOS)
+        // Sibling-relay relaunch: a dying LiveContainer install hands us its own
+        // relaunch, because nothing in ITS process tree can survive its death
+        // (see LCSharedUtils.relaunchViaSiblingThenExit). Wait for the sender to
+        // die, reopen it by bundle id, then bow out.
+        if url.host?.lowercased() == "lc-relay-relaunch" {
+            performRelayRelaunch(url: url)
+            return
+        }
+#endif
         repeat {
             if url.isFileURL {
                 sharedModel.selectedTab = .apps
@@ -191,6 +201,52 @@ struct LCTabView: View {
 
         sharedModel.deepLink = url
     }
+
+#if os(visionOS)
+    func performRelayRelaunch(url: URL) {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return }
+        var senderPid: Int32 = 0
+        var target: String? = nil
+        for item in components.queryItems ?? [] {
+            if item.name == "pid" { senderPid = Int32(item.value ?? "") ?? 0 }
+            if item.name == "target" { target = item.value }
+        }
+        // Never relay for ourselves — that's the resurrect-a-dead-app trap this
+        // mechanism exists to escape.
+        guard senderPid > 0, let target, target != Bundle.main.bundleIdentifier else { return }
+        relayMark("relay request: pid=\(senderPid) target=\(target)")
+        Task.detached(priority: .userInitiated) {
+            var steps = 0 // 50ms each; ESRCH (not EPERM) is the only reliable "gone"
+            while !(kill(senderPid, 0) == -1 && errno == ESRCH) && steps < 160 {
+                usleep(50000)
+                steps += 1
+            }
+            relayMark(steps < 160 ? "sender gone after \(steps * 50)ms" : "sender STILL alive after 8s — opening anyway")
+            usleep(250000)
+            for attempt in 1...4 {
+                let ok = LCSharedUtils.openApplication(withBundleID: target)
+                relayMark("open \(target) attempt \(attempt) -> \(ok)")
+                if ok { break }
+                usleep(600000)
+            }
+            // Job done; the target is foreground now. Our death needs no relay.
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            exit(0)
+        }
+    }
+
+    nonisolated func relayMark(_ msg: String) {
+        let path = NSHomeDirectory() + "/Documents/lc-relay.log"
+        let line = String(format: "%.3f relay[%d]: %@\n", CFAbsoluteTimeGetCurrent(), getpid(), msg)
+        if let handle = FileHandle(forWritingAtPath: path) {
+            handle.seekToEndOfFile()
+            handle.write(line.data(using: .utf8)!)
+            handle.closeFile()
+        } else {
+            try? line.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+#endif
     
     func closeDuplicatedWindow() {
         if let session = sceneDelegate.window?.windowScene?.session, DataManager.shared.model.mainWindowOpened {

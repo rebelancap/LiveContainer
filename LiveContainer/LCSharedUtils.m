@@ -3,6 +3,8 @@
 #import "UIKitPrivate.h"
 #import "utils.h"
 @import MachO;
+#import <notify.h>
+#import <objc/message.h>
 
 extern NSUserDefaults *lcUserDefaults;
 extern NSString *lcAppUrlScheme;
@@ -144,6 +146,15 @@ extern NSBundle *lcMainBundle;
     }
     NSURL *launchURL = [NSURL URLWithString:[NSString stringWithFormat:urlScheme, NSBundle.mainBundle.bundleIdentifier]];
 
+#if TARGET_OS_VISION
+    // visionOS: FrontBoard does NOT relaunch a dead app to deliver a pending URL
+    // (iOS kill-in-completion and suspend-then-die verified dead on-device
+    // 2026-08-07), and an extension proxy dies with its host before it can act
+    // (verified 2026-08-08). The only process that can reopen us is another APP —
+    // a sibling LiveContainer install relays the relaunch.
+    [self relaunchViaSiblingThenExit];
+    return YES;
+#endif
     if ([application canOpenURL:launchURL]) {
         //[UIApplication.sharedApplication suspend];
         for (int i = 0; i < tries; i++) {
@@ -163,6 +174,75 @@ extern NSBundle *lcMainBundle;
         exit(0);
     }
     return NO;
+}
+
+#if TARGET_OS_VISION
+// Relaunch by SIBLING: hand the relaunch to another installed LiveContainer
+// (livecontainer2/3 — an APP, whose lifetime is independent of ours), then die.
+// The sibling polls our pid, and once we're gone reopens us by bundle id; the
+// fresh process boots per lcUserDefaults["selected"] — the guest for a RUN
+// handoff, the UI when the guest quit (LCGuestQuitToLC resets selected to "ui"
+// and synchronizes BEFORE this runs, so _exit is safe). Receiver:
+// LCTabView.dispatchURL, host "lc-relay-relaunch".
+// Everything in-process is a verified dead end on this platform: FrontBoard
+// won't resurrect a dead app for a pending URL (2026-08-07), and ANY extension
+// we spawn is SIGKILLed within ~100ms of our death, straight through a granted
+// performExpiringActivity window (2026-08-08). Only an app can outlive us.
++ (void)relaunchMark:(NSString *)stage {
+    const char *lcHome = getenv("LC_HOME_PATH") ?: getenv("HOME");
+    if(!lcHome) return;
+    char p[1024];
+    snprintf(p, sizeof p, "%s/Documents/lc-exit-relaunch.log", lcHome);
+    FILE *f = fopen(p, "a");
+    if(f) { fprintf(f, "%.3f SharedUtils: %s\n", CFAbsoluteTimeGetCurrent(), stage.UTF8String); fclose(f); }
+}
+
++ (void)relaunchViaSiblingThenExit {
+    NSString *lcBundleId = lcMainBundle.bundleIdentifier ?: NSBundle.mainBundle.bundleIdentifier;
+    NSString *ownScheme = lcAppUrlScheme ?: @"livecontainer";
+    LSApplicationWorkspace *workspace = [PrivClass(LSApplicationWorkspace) defaultWorkspace];
+
+    NSURL *relayURL = nil;
+    for(NSString *scheme in [self lcUrlSchemes]) {
+        if([scheme isEqualToString:ownScheme]) continue;
+        // Not canOpenURL: — that gates on our Info.plist query schemes, which a
+        // guest's swapped plist doesn't have. This workspace probe has no gate.
+        NSURL *probe = [NSURL URLWithString:[NSString stringWithFormat:@"%@://", scheme]];
+        NSError *err = nil;
+        if(![workspace isApplicationAvailableToOpenURL:probe error:&err]) continue;
+        relayURL = [NSURL URLWithString:[NSString stringWithFormat:@"%@://lc-relay-relaunch?pid=%d&target=%@",
+                                         scheme, getpid(), lcBundleId]];
+        break;
+    }
+    if(!relayURL) {
+        [self relaunchMark:@"no sibling LC installed — plain exit; next manual launch honors `selected`"];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ exit(0); });
+        return;
+    }
+    // Pre-announce over Darwin state so the sibling's BOOTSTRAP handles the relay
+    // before its UI exists (no window flash; LCBootstrap
+    // LCVisionRelayRelaunchIfRequested). The URL open below is then only the
+    // launch trigger — and the sibling's UI handler is the fallback if the state
+    // goes stale before delivery. state = (our pid << 8) | own-scheme index.
+    NSString *team = [self teamIdentifier] ?: @"lc";
+    NSUInteger schemeIdx = [[self lcUnorderedUrlSchemes] indexOfObject:ownScheme];
+    if(schemeIdx == NSNotFound) schemeIdx = 0;
+    int stateToken = 0, timeToken = 0;
+    notify_register_check([NSString stringWithFormat:@"%@.lcrelay.state", team].UTF8String, &stateToken);
+    notify_register_check([NSString stringWithFormat:@"%@.lcrelay.time", team].UTF8String, &timeToken);
+    notify_set_state(stateToken, ((uint64_t)getpid() << 8) | (uint64_t)(schemeIdx & 0xFF));
+    notify_set_state(timeToken, (uint64_t)time(NULL));
+
+    BOOL ok = [workspace openURL:relayURL];
+    [self relaunchMark:[NSString stringWithFormat:@"relay open %@ -> %d", relayURL.absoluteString, ok]];
+    // Give lsd/FrontBoard a beat to commit the open, then die. No handshake
+    // needed: the sibling acts on our pid's ESRCH, however and whenever we exit.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ _exit(0); });
+}
+#endif
+
++ (BOOL)openApplicationWithBundleID:(NSString*)bundleId {
+    return [[PrivClass(LSApplicationWorkspace) defaultWorkspace] openApplicationWithBundleID:bundleId];
 }
 
 + (BOOL)launchToGuestAppWithURL:(NSURL *)url {

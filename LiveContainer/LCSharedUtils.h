@@ -17,4 +17,5 @@
 + (NSString*)findDefaultContainerWithBundleId:(NSString*)bundleId;
 + (NSArray<NSString*>*)lcUnorderedUrlSchemes;
 + (NSArray<NSString*>*)lcUrlSchemes;
++ (BOOL)openApplicationWithBundleID:(NSString*)bundleId;
 @end

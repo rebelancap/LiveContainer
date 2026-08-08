@@ -11,6 +11,7 @@
 
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <notify.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <stdlib.h>
@@ -19,6 +20,16 @@
 #include <mach-o/ldsyms.h>
 
 static int (*appMain)(int, char**);
+#if TARGET_OS_VISION
+// exit() interpose for single-app guests — see the rebind site in invokeAppMain.
+static void (*lcRealExit)(int) = NULL;
+static void lcHookExitQuitToLC(int code) {
+    void (*quitToLC)(void) = dlsym(RTLD_DEFAULT, "LCGuestQuitToLC");
+    if(quitToLC) quitToLC();
+    if(lcRealExit) lcRealExit(code);
+    _exit(code);
+}
+#endif
 NSUserDefaults *lcUserDefaults;
 NSUserDefaults *lcSharedDefaults;
 NSString *lcAppGroupPath;
@@ -553,6 +564,20 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     }
     // ignore setting handler from guest app
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, NSSetUncaughtExceptionHandler, hook_do_nothing, nil);
+#if TARGET_OS_VISION
+    // Auto-return with NO port patch: any engine quit that funnels through exit()
+    // runs the quit-to-LC dance — AFTER the engine's own shutdown/config-save, i.e.
+    // strictly later (and safer) than a pre-shutdown Sys_Quit hook. GLOBAL rebinds
+    // cover images loaded later too (litehook registers an add-image callback), so
+    // the guest binary is patched even though it loads after this line. The dance
+    // _exits us on success; on failure/inapplicability LCGuestQuitToLC returns (it
+    // self-guards re-entry via `selected`) and the real exit proceeds, atexit
+    // handlers intact. Single-app only: in LiveProcess the host UI handles exits.
+    if(!isLiveProcess) {
+        lcRealExit = exit; // capture before the rebind patches the GOT slots
+        litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, exit, lcHookExitQuitToLC, nil);
+    }
+#endif
     
     BOOL hookDlopen = !isSideStore && !isSharedBundle && LCSharedUtils.certificatePassword && isLiveProcess;
     DyldHooksInit([guestAppInfo[@"hideLiveContainer"] boolValue], hookDlopen, [guestAppInfo[@"spoofSDKVersion"] unsignedIntValue]);
@@ -687,7 +712,7 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
 }
 
 static void exceptionHandler(NSException *exception) {
-    NSString *error = [NSString stringWithFormat:@"%@\nCall stack: %@", exception.reason, exception.callStackSymbols];
+    NSString *error = [NSString stringWithFormat:@"[%@] %@\nuserInfo: %@\nCall stack: %@", exception.name, exception.reason, exception.userInfo, exception.callStackSymbols];
     if(isLiveProcess) {
         NSExtensionContext *context = [NSClassFromString(@"LiveProcessHandler") extensionContext];
         [context cancelRequestWithError:[NSError errorWithDomain:@"LiveProcess" code:1 userInfo:@{NSLocalizedDescriptionKey: error}]];
@@ -695,6 +720,71 @@ static void exceptionHandler(NSException *exception) {
         [lcUserDefaults setObject:error forKey:@"error"];
     }
 }
+
+#if TARGET_OS_VISION
+// Sibling relay, bootstrap side: a dying LiveContainer install pre-announced a
+// relaunch over Darwin notify state (see LCSharedUtils.relaunchViaSiblingThenExit)
+// and opened our URL scheme purely to get us launched. Handle it HERE, before any
+// UI exists: wait for the sender to die, reopen it by scheme, exit — so the relay
+// shows only the system launch placeholder, never a LiveContainer window. Exiting
+// pre-scene is safe on visionOS precisely because of the limitation that forced
+// this design: the shell never resurrects a dead app to deliver its pending URL.
+// LCTabView.performRelayRelaunch stays as the fallback if this misses the state.
+static void relayMark(const char *fmt, ...) {
+    const char *home = getenv("HOME");
+    if(!home) return;
+    char p[1024];
+    snprintf(p, sizeof p, "%s/Documents/lc-relay.log", home);
+    FILE *f = fopen(p, "a");
+    if(!f) return;
+    fprintf(f, "%.3f boot[%d]: ", CFAbsoluteTimeGetCurrent(), getpid());
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
+static void LCVisionRelayRelaunchIfRequested(void) {
+    NSString *team = [LCSharedUtils teamIdentifier] ?: @"lc";
+    int stateToken = 0, timeToken = 0;
+    uint64_t state = 0, when = 0;
+    notify_register_check([NSString stringWithFormat:@"%@.lcrelay.state", team].UTF8String, &stateToken);
+    notify_register_check([NSString stringWithFormat:@"%@.lcrelay.time", team].UTF8String, &timeToken);
+    notify_get_state(stateToken, &state);
+    notify_get_state(timeToken, &when);
+    uint64_t now = (uint64_t)time(NULL);
+    if(state == 0 || when == 0 || now < when || now - when > 30) return; // no fresh request
+    pid_t sender = (pid_t)(state >> 8);
+    NSUInteger schemeIdx = state & 0xFF;
+    NSArray<NSString *> *schemes = [LCSharedUtils lcUnorderedUrlSchemes];
+    if(schemeIdx >= schemes.count) return;
+    NSString *targetScheme = schemes[schemeIdx];
+    // Never relay for ourselves — that's the resurrect-a-dead-app trap this
+    // mechanism exists to escape.
+    if([targetScheme isEqualToString:lcAppUrlScheme]) return;
+    if(sender <= 0 || sender == getpid()) return;
+    notify_set_state(timeToken, 0); // consume
+
+    relayMark("relay request: sender pid=%d target scheme=%s", sender, targetScheme.UTF8String);
+    int steps = 0; // 50ms each; ESRCH (not EPERM) is the only reliable "gone"
+    while(!(kill(sender, 0) == -1 && errno == ESRCH) && steps < 160) {
+        usleep(50000);
+        steps++;
+    }
+    relayMark(steps < 160 ? "sender gone after %dms" : "sender STILL alive after %dms — opening anyway", steps * 50);
+    usleep(250000);
+    NSURL *url = [NSURL URLWithString:[targetScheme stringByAppendingString:@"://"]];
+    for(int attempt = 1; attempt <= 4; attempt++) {
+        BOOL ok = [[PrivClass(LSApplicationWorkspace) defaultWorkspace] openURL:url];
+        relayMark("open %s attempt %d -> %d", targetScheme.UTF8String, attempt, ok);
+        if(ok) break;
+        usleep(600000);
+    }
+    exit(0);
+}
+#endif
 
 int LiveContainerMain(int argc, char *argv[]) {
     lcMainBundle = [NSBundle mainBundle];
@@ -705,6 +795,9 @@ int LiveContainerMain(int argc, char *argv[]) {
     lcAppGroupPath = [[NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:[NSClassFromString(@"LCSharedUtils") appGroupID]] path];
     isLiveProcess = [lcAppUrlScheme isEqualToString:@"liveprocess"];
     setenv("LC_HOME_PATH", getenv("HOME"), 0);
+#if TARGET_OS_VISION
+    if(!isLiveProcess) LCVisionRelayRelaunchIfRequested();
+#endif
 
     NSString *selectedApp = [lcUserDefaults stringForKey:@"selected"];
     NSString *selectedContainer = [lcUserDefaults stringForKey:@"selectedContainer"];
