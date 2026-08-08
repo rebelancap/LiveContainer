@@ -65,6 +65,19 @@ int LiveProcessMain(int argc, char *argv[]) {
     [lcUserDefaults setObject:appInfo[@"launchAppUrlScheme"] forKey:@"launchAppUrlScheme"];
     [lcUserDefaults setObject:appInfo[@"selected"] forKey:@"selected"];
     [lcUserDefaults setObject:appInfo[@"selectedContainer"] forKey:@"selectedContainer"];
+
+    // Receive the JIT-Less signing cert from the host (see AppSceneViewController) and store
+    // it in lcSharedDefaults, where LCSharedUtils.certificatePassword / LCUtils.certificateData
+    // look for it. Without this the guest launch aborts with "JITLess mode is required" when
+    // the shared app-group defaults aren't reachable.
+    NSData *certData = appInfo[@"LCCertificateData"];
+    if(certData) {
+        [NSUserDefaults.lcSharedDefaults setObject:certData forKey:@"LCCertificateData"];
+    }
+    NSString *certPassword = appInfo[@"LCCertificatePassword"];
+    if(certPassword) {
+        [NSUserDefaults.lcSharedDefaults setObject:certPassword forKey:@"LCCertificatePassword"];
+    }
     
     bool access = false;
     NSArray* bookmarks = appInfo[@"bookmarks"];

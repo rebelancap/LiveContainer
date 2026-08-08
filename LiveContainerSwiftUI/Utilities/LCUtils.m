@@ -68,12 +68,22 @@
     [lcUserDefaults removeObjectForKey:@"selected"];
     [lcUserDefaults removeObjectForKey:@"selectedContainer"];
     
+    BOOL preferNativeWindow = [NSUserDefaults.lcSharedDefaults integerForKey:@"LCMultitaskMode"] == 1;
+#if TARGET_OS_VISION
+    // On visionOS each guest gets its OWN spatial window (a SwiftUI WindowGroup) rather than a
+    // decorated in-app view — the native visionOS multi-window experience the user expects.
+    preferNativeWindow = YES;
+#endif
     dispatch_async(dispatch_get_main_queue(), ^{
         if (@available(iOS 16.1, *)) {
-            if(UIApplication.sharedApplication.supportsMultipleScenes && [NSUserDefaults.lcSharedDefaults integerForKey:@"LCMultitaskMode"] == 1) {
+            if(UIApplication.sharedApplication.supportsMultipleScenes && preferNativeWindow) {
                 [MultitaskWindowManager openAppWindowWithDisplayName:displayName dataUUID:dataUUID bundleId:bundleId pidCallback:completionHandler];
+#if !TARGET_OS_VISION
+                // The floating multitask dock is an iPad affordance; visionOS uses the system
+                // window chrome instead, so skip it there.
                 MultitaskDockManager *dock = [MultitaskDockManager shared];
                 [dock addRunningApp:displayName appUUID:dataUUID view:nil];
+#endif
                 return;
             }
         }

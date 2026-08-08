@@ -13,8 +13,289 @@
 #import "LCSharedUtils.h"
 #import "utils.h"
 
+#if TARGET_OS_VISION
+#import <objc/runtime.h>
+#import <objc/message.h>
+// ===== MRUI STATE DUMP, host side (Track A of Fable/ORNAMENTS-NEXT-STEPS.md; temporary) =====
+// Identical dump to the guest-side one in TweakLoader/UIKit+GuestHooks.m, but run in
+// LiveContainer's OWN UI process — the WORKING baseline (full native chrome). Diff
+// lc-mrui-host.log against lc-mrui-guest.log to find what entity-backing state guests lack.
+//
+// RETIRED 2026-07-31 (flip to 1 to re-enable): lc-mrui-host.log has 4 complete baseline
+// dumps, whose key fact is that even the host's own working SwiftUI ornaments never register
+// with MRUIPlatterOrnamentManager (count stays 0) — SwiftUI bypasses the UIKit ornament
+// manager entirely. After writing COMPLETE, the dump then crashed the host five times
+// overnight (LiveContainer-2026-07-31-0141*..0146*.ips: LCMRUIDumpAll+1816, msgSend to a
+// dangling id at scope teardown — suspect valueForKey:@"ornaments" returning a non-object
+// that ARC then releases). If re-enabling, port the type-checked ornaments accessor from
+// the TweakLoader copy first.
+#define LC_MRUI_HOST_DUMP 0
+#if LC_MRUI_HOST_DUMP
+static BOOL LCMRUIInteresting(NSString *s) {
+    static NSRegularExpression *re;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:@"mrui|ornament|entity|realit|platter|spatial|stage"
+                                                       options:NSRegularExpressionCaseInsensitive error:nil];
+    });
+    return [re firstMatchInString:s options:0 range:NSMakeRange(0, s.length)] != nil;
+}
+
+// Writes incrementally with fflush so a crash mid-dump still leaves a log pinpointing the
+// fatal line. Ivar VALUES are peeked only for name/type-matched (MRUI-ish) ivars, and without
+// an ARC retain — blindly retaining every '@' ivar crashed on dangling weak/unretained slots.
+static void LCMRUIDumpObjectState(id obj, FILE *f) {
+    for(Class c = object_getClass(obj); c && c != NSObject.class; c = class_getSuperclass(c)) {
+        unsigned int ivarCount = 0;
+        Ivar *ivars = class_copyIvarList(c, &ivarCount);
+        for(unsigned int i = 0; i < ivarCount; i++) {
+            const char *nameC = ivar_getName(ivars[i]);
+            const char *type = ivar_getTypeEncoding(ivars[i]);
+            NSString *ivarName = @(nameC ?: "?");
+            NSString *typeStr = @(type ?: "");
+            if(!LCMRUIInteresting(ivarName) && !LCMRUIInteresting(typeStr)) continue;
+            if(type && type[0] == '@') {
+                fprintf(f, "    ivar %s.%s (%s) = ", class_getName(c), nameC ?: "?", type);
+                fflush(f);
+                void *raw = *(void **)((char *)(__bridge void *)obj + ivar_getOffset(ivars[i]));
+                Class valueClass = raw ? object_getClass((__bridge id)raw) : Nil;
+                fprintf(f, "%s\n", raw ? (valueClass ? class_getName(valueClass) : "?") : "nil");
+            } else {
+                fprintf(f, "    ivar %s.%s (%s) [non-object]\n", class_getName(c), nameC ?: "?", type ?: "?");
+            }
+        }
+        free(ivars);
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(c, &methodCount);
+        NSMutableArray *hits = [NSMutableArray array];
+        for(unsigned int i = 0; i < methodCount; i++) {
+            NSString *sel = NSStringFromSelector(method_getName(methods[i]));
+            if(LCMRUIInteresting(sel)) [hits addObject:sel];
+        }
+        free(methods);
+        if(hits.count) {
+            [hits sortUsingSelector:@selector(caseInsensitiveCompare:)];
+            fprintf(f, "    methods %s: %s\n", class_getName(c), [hits componentsJoinedByString:@" "].UTF8String);
+        }
+        fflush(f);
+    }
+}
+
+static void LCMRUIDumpAll(NSString *tag, NSString *logPath) {
+    FILE *f = fopen(logPath.fileSystemRepresentation, "a");
+    if(!f) {
+        NSLog(@"[LCMRUIDump/%@] cannot open %@", tag, logPath);
+        return;
+    }
+    fprintf(f, "===== MRUI dump [%s] t=%.3f pid=%d lcHome=%s =====\n", tag.UTF8String,
+            CFAbsoluteTimeGetCurrent(), getpid(), getenv("LC_HOME_PATH") ?: "(unset)");
+    fflush(f);
+    NSBundle *mb = NSBundle.mainBundle;
+    fprintf(f, "mainBundle: id=%s path=%s sceneManifest=%s\n",
+            mb.bundleIdentifier.UTF8String ?: "?", mb.bundlePath.UTF8String ?: "?",
+            [mb objectForInfoDictionaryKey:@"UIApplicationSceneManifest"] ? "present" : "ABSENT");
+    fflush(f);
+    // API map for the planned manual-ornament-injection experiment: full (unfiltered) method
+    // lists of the ornament classes, instance + class side.
+    static const char *lcOrnClasses[] = {"MRUIPlatterOrnament", "MRUIOrnamentsItem", "UIOrnament",
+                                         "_MRUIOrnamentClientConfigurationUpdater", "_MRUIOrnamentHostWindowObserver", NULL};
+    for(int ci = 0; lcOrnClasses[ci]; ci++) {
+        Class oc = objc_getClass(lcOrnClasses[ci]);
+        if(!oc) {
+            fprintf(f, "ORNCLASS %s: not present\n", lcOrnClasses[ci]);
+            continue;
+        }
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(oc, &mc);
+        NSMutableArray *sels = [NSMutableArray array];
+        for(unsigned int i = 0; i < mc; i++) [sels addObject:NSStringFromSelector(method_getName(ms[i]))];
+        free(ms);
+        [sels sortUsingSelector:@selector(caseInsensitiveCompare:)];
+        fprintf(f, "ORNCLASS %s (%u): %s\n", lcOrnClasses[ci], mc, [sels componentsJoinedByString:@" "].UTF8String);
+        unsigned int cmc = 0;
+        Method *cms = class_copyMethodList(object_getClass(oc), &cmc);
+        NSMutableArray *csels = [NSMutableArray array];
+        for(unsigned int i = 0; i < cmc; i++) [csels addObject:NSStringFromSelector(method_getName(cms[i]))];
+        free(cms);
+        if(csels.count) {
+            [csels sortUsingSelector:@selector(caseInsensitiveCompare:)];
+            fprintf(f, "ORNCLASS +%s (%u): %s\n", lcOrnClasses[ci], cmc, [csels componentsJoinedByString:@" "].UTF8String);
+        }
+        fflush(f);
+    }
+    for(UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        fprintf(f, "SCENE %s role=%s session=%s\n", class_getName(scene.class),
+                scene.session.role.UTF8String ?: "?", scene.session.persistentIdentifier.UTF8String ?: "?");
+        fflush(f);
+        LCMRUIDumpObjectState(scene, f);
+        SEL supportsOrnSel = NSSelectorFromString(@"_mrui_supportsPlatterOrnamentManager");
+        if([scene respondsToSelector:supportsOrnSel]) {
+            fprintf(f, "  calling _mrui_supportsPlatterOrnamentManager...\n");
+            fflush(f);
+            BOOL v = ((BOOL (*)(id, SEL))objc_msgSend)(scene, supportsOrnSel);
+            fprintf(f, "  _mrui_supportsPlatterOrnamentManager = %d\n", v);
+        }
+        SEL ornMgrSel = NSSelectorFromString(@"_mrui_platterOrnamentManagerIfExists");
+        if([scene respondsToSelector:ornMgrSel]) {
+            fprintf(f, "  calling _mrui_platterOrnamentManagerIfExists...\n");
+            fflush(f);
+            id ornMgr = ((id (*)(id, SEL))objc_msgSend)(scene, ornMgrSel);
+            fprintf(f, "  _mrui_platterOrnamentManagerIfExists = %s\n", ornMgr ? class_getName(object_getClass(ornMgr)) : "nil");
+            if(ornMgr) {
+                // Entity backing turned out fine everywhere; the ornament question moved into
+                // this manager. Dump its full state and its registered ornaments.
+                LCMRUIDumpObjectState(ornMgr, f);
+                fprintf(f, "  reading ornament manager description...\n");
+                fflush(f);
+                NSString *mgrDesc = [ornMgr description] ?: @"?";
+                if(mgrDesc.length > 500) mgrDesc = [mgrDesc substringToIndex:500];
+                fprintf(f, "  manager: %s\n", mgrDesc.UTF8String);
+                fflush(f);
+                id ornaments = nil;
+                @try {
+                    ornaments = [ornMgr valueForKey:@"ornaments"];
+                } @catch(NSException *e) {
+                    fprintf(f, "  ornaments KVC threw: %s\n", e.name.UTF8String ?: "?");
+                }
+                if([ornaments respondsToSelector:@selector(count)]) {
+                    fprintf(f, "  ornaments count = %lu\n", (unsigned long)[ornaments count]);
+                    for(id orn in ornaments) {
+                        fprintf(f, "  ORNAMENT %s\n", class_getName(object_getClass(orn)));
+                        fflush(f);
+                        NSString *desc = [orn description] ?: @"?";
+                        if(desc.length > 400) desc = [desc substringToIndex:400];
+                        fprintf(f, "    %s\n", desc.UTF8String);
+                        LCMRUIDumpObjectState(orn, f);
+                    }
+                } else {
+                    fprintf(f, "  ornaments = %s (no count)\n", ornaments ? class_getName(object_getClass(ornaments)) : "nil");
+                }
+                fflush(f);
+            }
+        }
+        if(![scene isKindOfClass:UIWindowScene.class]) continue;
+        for(UIWindow *w in ((UIWindowScene *)scene).windows) {
+            fprintf(f, "  WINDOW %s frame=%s key=%d\n", class_getName(w.class),
+                    NSStringFromCGRect(w.frame).UTF8String, w.isKeyWindow);
+            fflush(f);
+            LCMRUIDumpObjectState(w, f);
+            fprintf(f, "    reading traits...\n");
+            fflush(f);
+            fprintf(f, "    traits: %s\n", w.traitCollection.description.UTF8String);
+            SEL sebSel = NSSelectorFromString(@"mrui_supportsEntityBacking");
+            if([w respondsToSelector:sebSel]) {
+                fprintf(f, "    calling mrui_supportsEntityBacking...\n");
+                fflush(f);
+                BOOL v = ((BOOL (*)(id, SEL))objc_msgSend)(w, sebSel);
+                fprintf(f, "    mrui_supportsEntityBacking = %d\n", v);
+            }
+            // _contentsEntity returns a raw CoreRE C++ entity pointer, NOT an ObjC object —
+            // treating it as id (ARC retain) crashed the previous dump builds. Probe entity
+            // state via BOOL accessors and log the entity only as an opaque pointer.
+            SEL hasEntitySel = NSSelectorFromString(@"mrui_hasEntity");
+            if([w respondsToSelector:hasEntitySel]) {
+                fprintf(f, "    calling mrui_hasEntity...\n");
+                fflush(f);
+                BOOL hasEntity = ((BOOL (*)(id, SEL))objc_msgSend)(w, hasEntitySel);
+                fprintf(f, "    mrui_hasEntity = %d\n", hasEntity);
+            }
+            SEL boundCtxSel = NSSelectorFromString(@"_mrui_hasBoundContext");
+            if([w respondsToSelector:boundCtxSel]) {
+                fprintf(f, "    calling _mrui_hasBoundContext...\n");
+                fflush(f);
+                BOOL hasCtx = ((BOOL (*)(id, SEL))objc_msgSend)(w, boundCtxSel);
+                fprintf(f, "    _mrui_hasBoundContext = %d\n", hasCtx);
+            }
+            SEL ceSel = NSSelectorFromString(@"_contentsEntity");
+            if([w respondsToSelector:ceSel]) {
+                fprintf(f, "    calling _contentsEntity (raw pointer)...\n");
+                fflush(f);
+                void *entityPtr = ((void *(*)(id, SEL))objc_msgSend)(w, ceSel);
+                fprintf(f, "    _contentsEntity = %p\n", entityPtr);
+            }
+            fflush(f);
+        }
+    }
+    fprintf(f, "===== MRUI dump [%s] COMPLETE =====\n", tag.UTF8String);
+    fclose(f);
+    NSLog(@"[LCMRUIDump/%@] complete -> %@", tag, logPath);
+}
+
+__attribute__((constructor))
+static void LCMRUIHostDumpInit(void) {
+    if(NSUserDefaults.lcGuestAppId) {
+        // Single-app guest — the TweakLoader copy of this dump covers it.
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        LCMRUIDumpAll(@"host", [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/lc-mrui-host.log"]);
+    });
+}
+#endif // LC_MRUI_HOST_DUMP
+
+// ===== HOST SPACER ORNAMENT (see +lcAddSpacerOrnamentForScene: in the header) =====
+// Same private-API recipe proven guest-side in TweakLoader/UIKit+GuestHooks.m
+// (Fable/ORNAMENTS-NEXT-STEPS.md ★ SOLVED): this beta's _UIRootPresentationController lacks
+// the transition-callback family the builtin animator consults during the ornament backing
+// window's root-VC attach, and a beta-only NSAssert fires on the nil-toView presentation.
+@interface LCHostAssertionHandler : NSAssertionHandler
+@end
+@implementation LCHostAssertionHandler
+static BOOL LCHostShouldSwallowAssertion(NSString *fileName, NSString *desc) {
+    return [desc containsString:@"compatibility flow"] ||
+           [fileName containsString:@"UIViewControllerBuiltinTransitionViewAnimator"];
+}
+- (void)handleFailureInMethod:(SEL)selector object:(id)object file:(NSString *)fileName lineNumber:(NSInteger)line description:(NSString *)format, ... {
+    va_list args; va_start(args, format);
+    NSString *desc = format ? [[NSString alloc] initWithFormat:format arguments:args] : @"";
+    va_end(args);
+    if(LCHostShouldSwallowAssertion(fileName, desc)) {
+        NSLog(@"[LC] swallowed host UIKit assertion (%@:%ld): %@", fileName, (long)line, desc);
+        return;
+    }
+    [NSException raise:NSInternalInconsistencyException format:@"%@ (%@:%ld)", desc, fileName, (long)line];
+}
+- (void)handleFailureInFunction:(NSString *)functionName file:(NSString *)fileName lineNumber:(NSInteger)line description:(NSString *)format, ... {
+    va_list args; va_start(args, format);
+    NSString *desc = format ? [[NSString alloc] initWithFormat:format arguments:args] : @"";
+    va_end(args);
+    if(LCHostShouldSwallowAssertion(fileName, desc)) {
+        NSLog(@"[LC] swallowed host UIKit assertion (%@:%ld): %@", fileName, (long)line, desc);
+        return;
+    }
+    [NSException raise:NSInternalInconsistencyException format:@"%@ (%@:%ld)", desc, fileName, (long)line];
+}
+@end
+
+static void LCHostInstallOrnamentShims(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSThread.mainThread.threadDictionary[NSAssertionHandlerKey] = [LCHostAssertionHandler new];
+        Class rootPC = NSClassFromString(@"_UIRootPresentationController");
+        if(!rootPC) return;
+        SEL durSel = NSSelectorFromString(@"durationForTransition:");
+        if(![rootPC instancesRespondToSelector:durSel]) {
+            class_addMethod(rootPC, durSel,
+                            imp_implementationWithBlock(^double(id pc, long t) { return 0.0; }), "d@:q");
+        }
+        for(NSString *selName in @[@"transitionViewDidStart:", @"transitionViewDidComplete:", @"transitionViewDidCancel:"]) {
+            SEL s = NSSelectorFromString(selName);
+            if(![rootPC instancesRespondToSelector:s]) {
+                class_addMethod(rootPC, s, imp_implementationWithBlock(^(id pc, id tv) {}), "v@:@");
+            }
+        }
+        SEL didEndSel = NSSelectorFromString(@"transitionView:didEndTransition:");
+        if(![rootPC instancesRespondToSelector:didEndSel]) {
+            class_addMethod(rootPC, didEndSel,
+                            imp_implementationWithBlock(^(id pc, id tv, long t) {}), "v@:@q");
+        }
+    });
+}
+#endif
+
 @interface AppSceneViewController()
 @property int resizeDebounceToken;
+@property CGSize lcLastPushedSize;
 @property CFTimeInterval lastResizeRequestTime;
 @property CGPoint normalizedOrigin;
 @property bool isNativeWindow;
@@ -30,6 +311,118 @@
 
 @implementation AppSceneViewController
 
+#if TARGET_OS_VISION
++ (void)lcAddSpacerOrnamentForScene:(UIWindowScene *)scene width:(CGFloat)width height:(CGFloat)height gap:(CGFloat)gap {
+    // Multitask-bar forensics (pull Documents/lc-spacer.log from LC's container).
+    NSString *lcSpacerLogPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/lc-spacer.log"];
+    FILE *slog = fopen(lcSpacerLogPath.fileSystemRepresentation, "a");
+    if(slog) {
+        fprintf(slog, "spacer request t=%.3f scene=%p w=%.0f h=%.0f gap=%.0f\n",
+                CFAbsoluteTimeGetCurrent(), scene, width, height, gap);
+    }
+    if(!scene) {
+        if(slog) { fprintf(slog, "  abort: nil scene\n"); fclose(slog); }
+        return;
+    }
+    static NSMapTable *lcSpacers;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lcSpacers = [NSMapTable weakToStrongObjectsMapTable]; });
+    if([lcSpacers objectForKey:scene]) {
+        if(slog) { fprintf(slog, "  skip: spacer already present\n"); fclose(slog); }
+        return;
+    }
+    LCHostInstallOrnamentShims();
+    Class ornClass = NSClassFromString(@"MRUIPlatterOrnament");
+    if(!ornClass) {
+        if(slog) { fprintf(slog, "  abort: no MRUIPlatterOrnament class\n"); fclose(slog); }
+        return;
+    }
+    id mgr = ((id (*)(id, SEL))objc_msgSend)(scene, NSSelectorFromString(@"mrui_platterOrnamentManager"));
+    if(!mgr) {
+        if(slog) { fprintf(slog, "  abort: no ornament manager\n"); fclose(slog); }
+        return;
+    }
+    // Deliberately empty content: the spacer only exists so the shell's chrome-displacement
+    // math accounts for the guest's ornament footprint. The backing window staying empty
+    // (the nil-toView presentation quirk) is a feature here.
+    UIViewController *vc = [UIViewController new];
+    vc.view.backgroundColor = UIColor.clearColor;
+    // height + gap: the spacer's bottom edge sets where the shell parks the grab bar, and the
+    // guest pill's bottom lands at gap+height — the extra gap keeps the bar clear below it
+    // instead of touching/overlapping (seen in multitask testing).
+    CGSize spacerSize = CGSizeMake(width, height + gap);
+    vc.preferredContentSize = spacerSize;
+    vc.modalPresentationStyle = UIModalPresentationFullScreen;
+    @try {
+        id orn = ((id (*)(id, SEL, id))objc_msgSend)([ornClass alloc], NSSelectorFromString(@"initWithViewController:"), vc);
+        if(!orn) return;
+        ((void (*)(id, SEL, CGPoint))objc_msgSend)(orn, NSSelectorFromString(@"setSceneAnchorPoint:"), CGPointMake(0.5, 1.0));
+        ((void (*)(id, SEL, CGPoint))objc_msgSend)(orn, NSSelectorFromString(@"setContentAnchorPoint:"), CGPointMake(0.5, 0.0));
+        ((void (*)(id, SEL, CGSize))objc_msgSend)(orn, NSSelectorFromString(@"setPreferredContentSize:"), spacerSize);
+        if([orn respondsToSelector:NSSelectorFromString(@"_setZOffset:")]) {
+            ((void (*)(id, SEL, double))objc_msgSend)(orn, NSSelectorFromString(@"_setZOffset:"), 0.0);
+        }
+        if([orn respondsToSelector:NSSelectorFromString(@"setOffset2D:")]) {
+            ((void (*)(id, SEL, CGPoint))objc_msgSend)(orn, NSSelectorFromString(@"setOffset2D:"), CGPointMake(0, gap));
+        }
+        // The spacer occupies the same spot as the guest's REAL ornament — never let it
+        // capture gaze/pinch away from it.
+        if([orn respondsToSelector:NSSelectorFromString(@"_setCanCaptureUI:")]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(orn, NSSelectorFromString(@"_setCanCaptureUI:"), NO);
+        }
+        ((void (*)(id, SEL, id))objc_msgSend)(mgr, NSSelectorFromString(@"addOrnament:"), orn);
+        UIWindow *hostWin = scene.keyWindow ?: scene.windows.firstObject;
+        SEL ppmSel = NSSelectorFromString(@"mrui_pointsPerMeter");
+        if(hostWin && [hostWin respondsToSelector:ppmSel]) {
+            double ppm = ((double (*)(id, SEL))objc_msgSend)(hostWin, ppmSel);
+            if(ppm > 0 && [orn respondsToSelector:NSSelectorFromString(@"_setPointsPerMeter:")]) {
+                ((void (*)(id, SEL, double))objc_msgSend)(orn, NSSelectorFromString(@"_setPointsPerMeter:"), ppm);
+            }
+        }
+        for(NSString *fixup in @[@"_updateWindowPointsPerMeter", @"_updateForCurrentKeyWindow", @"_setNeedsUpdate"]) {
+            SEL s = NSSelectorFromString(fixup);
+            if([orn respondsToSelector:s]) {
+                ((void (*)(id, SEL))objc_msgSend)(orn, s);
+            }
+        }
+        // The empty backing window paints itself dark, showing up as a phantom capsule
+        // behind the guest's real ornament — force every layer of it clear.
+        UIWindow *sbw = ((UIWindow *(*)(id, SEL))objc_msgSend)(orn, NSSelectorFromString(@"_window"));
+        sbw.backgroundColor = UIColor.clearColor;
+        for(UIView *sv in sbw.subviews) sv.backgroundColor = UIColor.clearColor;
+        [lcSpacers setObject:orn forKey:scene];
+        NSLog(@"[LC] host spacer ornament added for scene %@", scene.session.persistentIdentifier);
+        if(slog) {
+            UIWindow *hw = scene.keyWindow ?: scene.windows.firstObject;
+            double hppm = 0;
+            SEL hppmSel = NSSelectorFromString(@"mrui_pointsPerMeter");
+            if(hw && [hw respondsToSelector:hppmSel]) {
+                hppm = ((double (*)(id, SEL))objc_msgSend)(hw, hppmSel);
+            }
+            fprintf(slog, "  added ok; host window ppm=%.1f\n", hppm);
+            fclose(slog);
+        }
+        // What did the shell actually receive? Log the committed config once it lands.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            FILE *slog2 = fopen(lcSpacerLogPath.fileSystemRepresentation, "a");
+            if(!slog2) return;
+            @try {
+                id cfg = ((id (*)(id, SEL))objc_msgSend)(orn, NSSelectorFromString(@"_committedConfiguration"));
+                fprintf(slog2, "  committed after 3s: %s\n", cfg ? [cfg description].UTF8String : "nil");
+            } @catch(NSException *e) {
+                fprintf(slog2, "  committed dump threw: %s\n", e.name.UTF8String ?: "?");
+            }
+            fclose(slog2);
+        });
+        return;
+    } @catch(NSException *e) {
+        NSLog(@"[LC] host spacer ornament failed: %@ %@", e.name, e.reason);
+        if(slog) { fprintf(slog, "  THREW: %s %s\n", e.name.UTF8String ?: "?", e.reason.UTF8String ?: "?"); fclose(slog); }
+        return;
+    }
+    if(slog) { fprintf(slog, "  fell through (orn init nil?)\n"); fclose(slog); }
+}
+#endif
 
 - (instancetype)initWithBundleId:(NSString*)bundleId dataUUID:(NSString*)dataUUID delegate:(id<AppSceneViewControllerDelegate>)delegate {
     self = [super initWithNibName:nil bundle:nil];
@@ -39,6 +432,10 @@
     self.scaleRatio = 1.0;
     self.isAppTerminationCleanUpCalled = false;
     self.isNativeWindow = [NSUserDefaults.lcSharedDefaults integerForKey:@"LCMultitaskMode" ] == 1;
+#if TARGET_OS_VISION
+    // visionOS always hosts a guest in its own spatial WindowGroup (see launchMultitaskGuestApp).
+    self.isNativeWindow = YES;
+#endif
     
     // init extension
     NSError* error = nil;
@@ -58,6 +455,18 @@
         @"bookmarks": bookmarks,
         @"lcHomePath": NSHomeDirectory(),
     }.mutableCopy;
+
+    // Hand the JIT-Less signing cert to LiveProcess. It normally reads this from the shared
+    // app-group defaults, but a guest launched into the extension must still get it when app
+    // groups aren't available (e.g. a development/hand-signed install), so pass it directly.
+    NSData *certData = LCUtils.certificateData;
+    if(certData) {
+        userInfo[@"LCCertificateData"] = certData;
+    }
+    NSString *certPassword = LCSharedUtils.certificatePassword;
+    if(certPassword) {
+        userInfo[@"LCCertificatePassword"] = certPassword;
+    }
     
     NSString* launchAppUrlScheme = [NSUserDefaults.standardUserDefaults stringForKey:@"launchAppUrlScheme"];
     [NSUserDefaults.lcUserDefaults removeObjectForKey:@"launchAppUrlScheme"];
@@ -122,7 +531,15 @@
     
     void (^updateSceneSettings)(id) = ^void(UIMutableApplicationSceneSettings *settings) {
         settings.canShowAlerts = YES;
-        settings.cornerRadiusConfiguration = [[PrivClass(BSCornerRadiusConfiguration) alloc] initWithTopLeft:self.view.layer.cornerRadius bottomLeft:self.view.layer.cornerRadius bottomRight:self.view.layer.cornerRadius topRight:self.view.layer.cornerRadius];
+#if TARGET_OS_VISION
+        // The guest rounds its own content at the standard ~46pt visionOS window radius, but the
+        // scene's backdrop honors THIS corner config — view.layer.cornerRadius is 0 here, which
+        // left a square black backdrop corner poking out from behind the guest's rounded content.
+        CGFloat lcSceneCornerRadius = 46;
+#else
+        CGFloat lcSceneCornerRadius = self.view.layer.cornerRadius;
+#endif
+        settings.cornerRadiusConfiguration = [[PrivClass(BSCornerRadiusConfiguration) alloc] initWithTopLeft:lcSceneCornerRadius bottomLeft:lcSceneCornerRadius bottomRight:lcSceneCornerRadius topRight:lcSceneCornerRadius];
         // No `UIScreen` on visionOS to take a display configuration from; the system
         // supplies one for the spatial scene.
 #if !TARGET_OS_VISION
@@ -251,10 +668,43 @@
 }
 
 - (void)viewWillLayoutSubviews {
+#if TARGET_OS_VISION
+    // visionOS: autoresizing the host (scene-hosting) view does NOT resize the guest's remote
+    // scene — the guest keeps rendering at its original size and gets clipped/letterboxed as
+    // the window grows. Push the new size straight into the guest scene on every size change.
+    // The existing debounce swallows every update during a live resize, so bypass it and push
+    // synchronously; a size guard keeps setting contentView.frame from looping back here.
+    CGSize newSize = self.view.bounds.size;
+    // Tolerance, not equality: SwiftUI's layout jitters by ±1pt between passes; pushing every
+    // jitter made the guest scene oscillate (and the guest-side window enforcer chase it) at 60Hz.
+    if((fabs(newSize.width - _lcLastPushedSize.width) >= 1.5 || fabs(newSize.height - _lcLastPushedSize.height) >= 1.5)
+       && newSize.width > 0 && newSize.height > 0) {
+        _lcLastPushedSize = newSize;
+        // Make the hosting view fill the window so its geometry reflects the new size.
+        self.contentView.frame = CGRectMake(0, 0, newSize.width, newSize.height);
+        UIMutableApplicationSceneSettings *settings = [self.presenter.scene.settings mutableCopy];
+        // Prefer UIKit's hosting-view geometry bridge if it exists on this OS; otherwise stuff
+        // the frame manually. (applyViewGeometryToSettings: is declared for iOS 19 but is NOT
+        // present on this visionOS build — calling it unconditionally crashes.)
+        _UISceneHostingView *sceneView = self.hostingController.sceneView;
+        SEL applyGeo = NSSelectorFromString(@"applyViewGeometryToSettings:");
+        if(sceneView && [sceneView respondsToSelector:applyGeo]) {
+            sceneView.frame = CGRectMake(0, 0, newSize.width, newSize.height);
+            void (*applyGeoImp)(id, SEL, id) = (void (*)(id, SEL, id))[sceneView methodForSelector:applyGeo];
+            applyGeoImp(sceneView, applyGeo, settings);
+        } else {
+            [settings setFrame:CGRectMake(0, 0, newSize.width, newSize.height)];
+            settings.interfaceOrientation = self.view.window.windowScene.interfaceOrientation;
+        }
+        UIApplicationSceneTransitionContext *ctx = [UIApplicationSceneTransitionContext new];
+        [self.presenter.scene updateSettings:settings withTransitionContext:ctx completion:nil];
+    }
+#else
     /// For native window we let iPadOS handle it however it wants, which is usually live resize (autoresizingMask set in appSceneVCWillActivateScene)
     if(_contentView.autoresizingMask != (UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight)) {
         [self updateFrameWithSettingsBlock:nil];
     }
+#endif
 }
 - (void)updateFrameWithSettingsBlock:(void (^)(UIMutableApplicationSceneSettings *settings))block {
     __block int currentDebounceToken = ++_resizeDebounceToken;
@@ -315,6 +765,16 @@
     if(UIInterfaceOrientationIsLandscape(tempSettings.interfaceOrientation)) {
         frame = CGRectMake(frame.origin.x, frame.origin.y, frame.size.height, frame.size.width);
     }
+#if TARGET_OS_VISION
+    // On visionOS, resizing the hosting view alone does NOT resize the remote guest scene — the
+    // guest keeps rendering at its original size and is clipped/letterboxed as the window grows.
+    // Push the geometry straight into the guest scene's settings so it re-lays-out to fill the
+    // window. (On iPad the hosting controller handles this from the view size, so this is
+    // visionOS-only.)
+    if(self.presenter.scene) {
+        [self.presenter.scene updateSettingsWithBlock:updateSettingsBlock];
+    }
+#endif
     
     if (self.contentView) {
         BOOL isiOS26 = NO;

@@ -42,5 +42,13 @@ API_AVAILABLE(ios(16.0))
 - (void)openURLScheme:(NSString *)urlString;
 - (void)handleStatusBarTapAction:(UIAction *)action;
 - (BOOL)usesHostingControllerAPI;
+#if TARGET_OS_VISION
+// Adds an invisible, depth-correct spacer ornament to the HOST scene so the shell moves the
+// window chrome (grab bar) below the guest's shell-composited ornament. Geometry comes from
+// the guest's registration (LCOrnamentFootprint-<appId> in app-group defaults). UIKit path
+// instead of SwiftUI .ornament because only it exposes _setZOffset: (SwiftUI's default floats
+// the bar ~14pt toward the viewer). Idempotent per scene.
++ (void)lcAddSpacerOrnamentForScene:(UIWindowScene *)scene width:(CGFloat)width height:(CGFloat)height gap:(CGFloat)gap;
+#endif
 @end
 

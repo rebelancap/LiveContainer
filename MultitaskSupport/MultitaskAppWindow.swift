@@ -159,10 +159,36 @@ struct MultitaskAppWindow: View {
                         DataManager.shared.model.pidCallback = nil
                     }
                 })
+                #if os(visionOS)
+                // No opaque backdrop: the guest rounds and fills its own content (TweakLoader
+                // masks guest windows at 46pt and keeps them tracking the scene size), so any
+                // sliver outside it should show the window's native glass, not a black slab.
+                .background(.clear)
+                #else
                 .background(.black)
+                #endif
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .ignoresSafeArea(.all, edges: .all)
+            #if os(visionOS)
+            // The guest's full-bleed black backdrop covers the system window's rounded glass,
+            // making it look square/non-native. Clip the hosted content to the window's corner
+            // radius so the rounding shows. (Radius is a best-guess visionOS window value —
+            // adjust if it doesn't match the system chrome.)
+            .clipShape(RoundedRectangle(cornerRadius: 46, style: .continuous))
+            // Chrome accounting for the guest's registered ornament (LCGuestAddOrnament in
+            // TweakLoader): the shell composites the GUEST's ornament platter below this
+            // window, but the grab bar belongs to THIS host scene and doesn't yield to another
+            // scene's ornament. An invisible spacer with the guest ornament's footprint makes
+            // the shell move the bar below it — native ordering: window, ornament, bar.
+            // UIKit-injected (not SwiftUI .ornament) because only the private path exposes
+            // _setZOffset:, and SwiftUI's default depth floats the re-anchored bar ~14pt
+            // toward the viewer. The guest publishes its footprint when it registers, so poll
+            // briefly; guests without ornaments never get a spacer.
+            .onAppear {
+                scheduleSpacerCheck(attempt: 0)
+            }
+            #endif
             .navigationTitle(Text("\(appInfo.displayName) - \(String(pid))"))
             .onReceive(pub) { out in
                 if let scene1 = sceneDelegate.window?.windowScene, let scene2 = out.object as? UIWindowScene, scene1 == scene2 {
@@ -224,6 +250,61 @@ struct MultitaskAppWindow: View {
         }
     }
     
+    #if os(visionOS)
+    private func spacerLog(_ msg: String) {
+        let p = NSHomeDirectory() + "/Documents/lc-spacer-poll.log"
+        let line = "\(Date()) \(msg)\n"
+        guard let d = line.data(using: .utf8) else { return }
+        if let h = FileHandle(forWritingAtPath: p) {
+            h.seekToEndOfFile()
+            h.write(d)
+            try? h.close()
+        } else {
+            try? line.write(toFile: p, atomically: true, encoding: .utf8)
+        }
+    }
+
+    private func scheduleSpacerCheck(attempt: Int) {
+        // The guest registers its ornament shortly after launch; poll for its published
+        // footprint, then give up (no ornament -> no spacer, bar stays put). Generous count:
+        // extension boot + scene connect + the guest's 8s registration + defaults sync can
+        // add up.
+        guard attempt < 20 else {
+            spacerLog("giving up after \(attempt) attempts")
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + (attempt == 0 ? 1.0 : 2.0)) {
+            guard let appInfo, show else {
+                spacerLog("attempt \(attempt): no appInfo or window closed")
+                return
+            }
+            // LC's internal app id carries the ".app" folder suffix; the guest publishes
+            // under its real bundle id (no suffix). Try both.
+            var candidates = ["LCOrnamentFootprint-\(appInfo.bundleId)"]
+            if appInfo.bundleId.hasSuffix(".app") {
+                candidates.append("LCOrnamentFootprint-\(String(appInfo.bundleId.dropLast(4)))")
+            }
+            let hit = candidates.lazy.compactMap { k in
+                LCUtils.appGroupUserDefault.dictionary(forKey: k).map { (k, $0) }
+            }.first
+            let key = hit?.0 ?? candidates.joined(separator: " / ")
+            if let fp = hit?.1,
+               let w = fp["width"] as? Double, let h = fp["height"] as? Double, let g = fp["gap"] as? Double {
+                if let ws = sceneDelegate.window?.windowScene {
+                    spacerLog("attempt \(attempt): footprint \(fp) -> adding spacer")
+                    AppSceneViewController.lcAddSpacerOrnament(for: ws, width: w, height: h, gap: g)
+                } else {
+                    spacerLog("attempt \(attempt): footprint present but no windowScene yet")
+                    scheduleSpacerCheck(attempt: attempt + 1)
+                }
+            } else {
+                spacerLog("attempt \(attempt): no value for \(key)")
+                scheduleSpacerCheck(attempt: attempt + 1)
+            }
+        }
+    }
+    #endif
+
     private func requestSceneDestruction(isManual: Bool = false) {
         if isManual {
             didRequestManualClose = true
