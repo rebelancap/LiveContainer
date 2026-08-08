@@ -592,7 +592,12 @@ uint32_t ZArchO::ReallocCodeSignSpace(const string& strNewFile)
 	case LC_SEGMENT_64:
 	{
 		segment_command_64* seglc = (segment_command_64*)m_pLinkEditSegment;
-		seglc->vmsize = ZUtil::ByteAlign(BO((uint32_t)seglc->vmsize) + (uNewLength - m_uLength), 4096);
+		// Align to 16K, not 4K: arm64 Apple platforms use 16K VM pages, so a segment
+		// whose vmsize isn't a multiple of 16384 is malformed. Aligning to 4096 only
+		// lands on a legal boundary by luck — it depends on the original vmsize and
+		// how much the signature grew — which is why this bites some binaries and not
+		// others. 16K alignment is also valid on 4K-page platforms.
+		seglc->vmsize = ZUtil::ByteAlign(BO((uint32_t)seglc->vmsize) + (uNewLength - m_uLength), 16384);
 		seglc->vmsize = BO((uint32_t)seglc->vmsize);
 		seglc->filesize = uNewLength - BO((uint32_t)seglc->fileoff);
 		seglc->filesize = BO((uint32_t)seglc->filesize);

@@ -3,6 +3,9 @@
 #include "mach-o.h"
 #include "openssl.h"
 #include "signing.h"
+// For TARGET_OS_VISION below — without it the macro is silently 0 and the code
+// signature would be built with the wrong page size.
+#include <TargetConditionals.h>
 
 void ZSign::_DERLength(string& strBlob, uint64_t uLength)
 {
@@ -408,7 +411,17 @@ bool ZSign::SlotBuildCodeDirectory(bool bAlternate,
 	cdHeader.hashSize = bAlternate ? 32 : 20;
 	cdHeader.hashType = bAlternate ? 2 : 1;
 	cdHeader.spare1 = 0;
+#if TARGET_OS_VISION
+	// log2(16384). Apple Silicon uses 16K VM pages, and visionOS refuses a signature
+	// whose code slots are 4K: dlopen of an otherwise byte-identical, correctly
+	// hashed, fully chained binary fails with "code signature invalid" (amfid:
+	// AppleMobileFileIntegrityError -400, F_ADDFILESIGS -> EPERM). Verified
+	// on-device — the same bytes re-signed by codesign, which emits 16K slots, load
+	// fine. iOS keeps 4K, where it has always been accepted.
+	cdHeader.pageSize = 14;
+#else
 	cdHeader.pageSize = 12;
+#endif
 	cdHeader.spare2 = 0;
 	cdHeader.scatterOffset = 0;
 	cdHeader.teamOffset = 0;
@@ -602,19 +615,38 @@ bool ZSign::SlotBuildCMSSignature(ZSignAsset* pSignAsset,
 
 	jvalue jvHashes;
 	string strCDHashesPlist;
-	string strCodeDirectorySlotSHA1;
-	string strAltnateCodeDirectorySlot256;
-	ZSHA::SHA1(strCodeDirectorySlot, strCodeDirectorySlotSHA1);
-	ZSHA::SHA256(strAltnateCodeDirectorySlot, strAltnateCodeDirectorySlot256);
-
-	size_t cdHashSize = strCodeDirectorySlotSHA1.size();
-	jvHashes["cdhashes"][0].assign_data(strCodeDirectorySlotSHA1.data(), cdHashSize);
-	jvHashes["cdhashes"][1].assign_data(strAltnateCodeDirectorySlot256.data(), cdHashSize);
-	jvHashes.style_write_plist(strCDHashesPlist);
-
 	string strCMSData;
-	if (!pSignAsset->GenerateCMS(strCodeDirectorySlot, strCDHashesPlist, strCodeDirectorySlotSHA1, strAltnateCodeDirectorySlot256, strCMSData)) {
-		return false;
+
+	if (strAltnateCodeDirectorySlot.empty()) {
+		// Single CodeDirectory (SHA-256 only) — what modern codesign emits and what
+		// modern AMFI (iOS 26 / visionOS) requires. A legacy SHA-1 CD in slot 0 is
+		// rejected outright (errSecCSSignatureFailed / amfid -400), so in this mode
+		// `strCodeDirectorySlot` already holds the SHA-256 CD and there is no alternate.
+		// Everything attests that one CD: the CMS content is the CD, its cdhash
+		// (SHA-256 truncated to 20 bytes) is the sole entry in the 9.1 plist, and its
+		// full 32-byte SHA-256 is the sole 9.2 hash-agility hash.
+		string strCodeDirectorySlot256;
+		ZSHA::SHA256(strCodeDirectorySlot, strCodeDirectorySlot256);
+		jvHashes["cdhashes"][0].assign_data(strCodeDirectorySlot256.data(), 20);
+		jvHashes.style_write_plist(strCDHashesPlist);
+
+		if (!pSignAsset->GenerateCMS(strCodeDirectorySlot, strCDHashesPlist, "", strCodeDirectorySlot256, strCMSData)) {
+			return false;
+		}
+	} else {
+		string strCodeDirectorySlotSHA1;
+		string strAltnateCodeDirectorySlot256;
+		ZSHA::SHA1(strCodeDirectorySlot, strCodeDirectorySlotSHA1);
+		ZSHA::SHA256(strAltnateCodeDirectorySlot, strAltnateCodeDirectorySlot256);
+
+		size_t cdHashSize = strCodeDirectorySlotSHA1.size();
+		jvHashes["cdhashes"][0].assign_data(strCodeDirectorySlotSHA1.data(), cdHashSize);
+		jvHashes["cdhashes"][1].assign_data(strAltnateCodeDirectorySlot256.data(), cdHashSize);
+		jvHashes.style_write_plist(strCDHashesPlist);
+
+		if (!pSignAsset->GenerateCMS(strCodeDirectorySlot, strCDHashesPlist, strCodeDirectorySlotSHA1, strAltnateCodeDirectorySlot256, strCMSData)) {
+			return false;
+		}
 	}
 
 	uint32_t uMagic = BE((uint32_t)CSMAGIC_BLOBWRAPPER);

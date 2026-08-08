@@ -1,6 +1,9 @@
 #include "common.h"
 #include "base64.h"
 #include "openssl.h"
+// For TARGET_OS_VISION below — without it the macro is silently 0 and guests would be
+// signed with the SHA-1-primary dual CodeDirectory that visionOS AMFI rejects.
+#include <TargetConditionals.h>
 #include <openssl/pem.h>
 #include <openssl/cms.h>
 #include <openssl/err.h>
@@ -237,6 +240,22 @@ bool ZSignAsset::GenerateCMS(void* pscert, void* pspkey, const string& strCDHash
 
 	if (!CMS_final(cms, in, NULL, nFlags)) {
 		return CMSError();
+	}
+
+	// Apple's amfid (iOS 26 / visionOS) requires the SignerInfo signatureAlgorithm to be
+	// sha256WithRSAEncryption. OpenSSL emits a bare rsaEncryption identifier, which macOS
+	// Security tolerates but visionOS AMFI rejects (dlopen -> F_ADDFILESIGS EPERM / amfid
+	// -400) — codesign, whose signatures load fine, uses sha256WithRSAEncryption. The RSA
+	// PKCS#1 v1.5 signature bytes are identical for either identifier, so relabelling the
+	// algorithm after signing is safe. Match codesign's explicit NULL parameter too.
+	STACK_OF(CMS_SignerInfo)* sinfos = CMS_get0_SignerInfos(cms);
+	if (sinfos && sk_CMS_SignerInfo_num(sinfos) > 0) {
+		CMS_SignerInfo* siFix = sk_CMS_SignerInfo_value(sinfos, 0);
+		X509_ALGOR *digAlg = NULL, *sigAlg = NULL;
+		CMS_SignerInfo_get0_algs(siFix, NULL, NULL, &digAlg, &sigAlg);
+		if (sigAlg) {
+			X509_ALGOR_set0(sigAlg, OBJ_nid2obj(NID_sha256WithRSAEncryption), V_ASN1_NULL, NULL);
+		}
 	}
 
 	BIO* out = BIO_new(BIO_s_mem());
@@ -890,6 +909,17 @@ bool ZSignAsset::InitSimple(const void* strSignerPKeyData, int strSignerPKeyData
 
     m_evpPKey = evpPKey;
     m_x509Cert = x509Cert;
+
+#if TARGET_OS_VISION
+    // Emit a single SHA-256 CodeDirectory instead of the legacy SHA-1-primary + SHA-256
+    // dual layout. Modern AMFI on visionOS rejects a SHA-1 CodeDirectory in slot 0
+    // outright (dlopen of an otherwise valid guest fails: errSecCSSignatureFailed / amfid
+    // AppleMobileFileIntegrityError -400), which is exactly what modern codesign avoids by
+    // signing arm64 dylibs with a single SHA-256 CD. iOS keeps the dual layout it has
+    // always shipped.
+    m_bSHA256Only = true;
+#endif
+
     return true;
 }
 
