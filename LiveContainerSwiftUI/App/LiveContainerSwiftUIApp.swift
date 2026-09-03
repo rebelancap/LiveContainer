@@ -14,6 +14,10 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
     @State var tweakFolderNames: [String]
     
     init() {
+        // pick up a certificate the installer dropped into our bundle before any view
+        // (notably LCSettingsView) reads the stored certificate state
+        LCUtils.autoImportBundledCertificateIfNeeded()
+        
         let fm = FileManager()
         var tempAppDataFolderNames : [String] = []
         var tempTweakFolderNames : [String] = []

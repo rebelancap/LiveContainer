@@ -6,6 +6,7 @@
 //
 
 import LocalAuthentication
+import CryptoKit
 
 extension LCUtils {
     public static let appGroupUserDefault = UserDefaults.init(suiteName: LCSharedUtils.appGroupID()) ?? UserDefaults.standard
@@ -514,6 +515,61 @@ extension LCUtils {
                 )
             }
         }
+    }
+    
+    // MARK: - Bundled certificate auto-import
+    
+    // Installers (iloader etc.) may drop an ALTCertificate.p12 into LC's bundle at sign
+    // time, together with an ALTCertificatePassword Info.plist key. Import it silently so
+    // the user never has to visit Settings. A certificate the user imported by hand is
+    // never overwritten.
+    public static func autoImportBundledCertificateIfNeeded() {
+        var candidates: [(URL, String)] = []
+        
+        let mainP12 = Bundle.main.bundleURL.appendingPathComponent("ALTCertificate.p12")
+        let mainPassword = Bundle.main.infoDictionary?["ALTCertificatePassword"] as? String ?? ""
+        candidates.append((mainP12, mainPassword))
+        
+        let sideStoreURL = Bundle.main.bundleURL.appendingPathComponent("Frameworks/SideStoreApp.framework")
+        let sideStoreP12 = sideStoreURL.appendingPathComponent("ALTCertificate.p12")
+        let sideStorePassword = Bundle(url: sideStoreURL)?.infoDictionary?["ALTCertificatePassword"] as? String ?? ""
+        candidates.append((sideStoreP12, sideStorePassword))
+        
+        let fm = FileManager.default
+        guard let (certificateURL, bundledPassword) = candidates.first(where: { fm.fileExists(atPath: $0.0.path) }),
+              let certificateData = try? Data(contentsOf: certificateURL) else {
+            return
+        }
+        
+        let hash = SHA256.hash(data: certificateData).map { String(format: "%02x", $0) }.joined()
+        
+        // Import only if nothing is stored yet, or if what's stored is a previous
+        // auto-import of a different (e.g. re-signed) certificate.
+        if LCSharedUtils.certificatePassword() != nil {
+            guard let importedHash = appGroupUserDefault.string(forKey: "LCAutoImportedCertificateSHA256"),
+                  importedHash != hash else {
+                return
+            }
+        }
+        
+        var passwordsToTry = [bundledPassword]
+        if !bundledPassword.isEmpty {
+            passwordsToTry.append("")
+        }
+        guard let certificatePassword = passwordsToTry.first(where: {
+            LCUtils.getCertTeamId(withKeyData: certificateData, password: $0) != nil
+        }) else {
+            NSLog("[LC] failed to validate bundled certificate at %@", certificateURL.path)
+            return
+        }
+        
+        appGroupUserDefault.set(certificateData, forKey: "LCCertificateData")
+        appGroupUserDefault.set(certificatePassword, forKey: "LCCertificatePassword")
+        appGroupUserDefault.set(NSDate.now, forKey: "LCCertificateUpdateDate")
+        appGroupUserDefault.set(hash, forKey: "LCAutoImportedCertificateSHA256")
+        UserDefaults.standard.set(certificatePassword, forKey: "LCCertificatePassword")
+        UserDefaults.standard.set(LCSharedUtils.appGroupID(), forKey: "LCAppGroupID")
+        NSLog("[LC] auto-imported bundled certificate from %@", certificateURL.path)
     }
     
     static func openSideStore(delegate: LCAppModelDelegate? = nil, urlStr: String? = nil) {
